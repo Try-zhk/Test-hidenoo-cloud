@@ -30,9 +30,12 @@ function maskIP(ip) {
     return parts.length === 4 ? `${parts[0]}.${parts[1]}.***.***` : '***';
 }
 
+// 到期时间精确到秒，用于 TG/邮件通知（明文）
 function formatDate(timestamp) {
     if (!timestamp) return '未知';
-    return new Date(timestamp).toISOString().split('T')[0]; 
+    const d = new Date(timestamp);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function getAccounts() {
@@ -87,6 +90,7 @@ async function saveCookieToGitHub(id, cookiesArr) {
     } catch (e) { console.error(`❌ 保存 Cookie 失败:`, e.message); }
 }
 
+// TG / 邮件通知：明文账号 + 明文出口IP + 精确到秒的到期时间
 async function sendNotifications(summaryArr) {
     let mdText = `☁️ *HidenCloud 自动续期报告*\n━━━━━━━━━━━━━━━━━━\n`;
     let htmlText = `<div style="font-family: Arial, sans-serif; max-width: 650px; margin: auto; border: 1px solid #e0e0e0; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
@@ -97,6 +101,7 @@ async function sendNotifications(summaryArr) {
 
     summaryArr.forEach(s => {
         mdText += `👤 **账号**: \`${s.user}\`\n`;
+        mdText += `🌐 **出口IP**: \`${s.ip || '未知'}\`\n`;
         mdText += `🔑 **登录**: ${s.loginMethod}\n`;
         if (s.status.includes('Failed')) {
             mdText += `❌ **异常**: ${s.status}\n`;
@@ -108,8 +113,9 @@ async function sendNotifications(summaryArr) {
 
         htmlText += `<div style="background: #ffffff; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 5px solid ${s.status.includes('Failed') ? '#e74c3c' : '#2ecc71'}; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
             <p style="margin: 5px 0; font-size: 16px;">👤 <b>账号:</b> ${s.user}</p>
+            <p style="margin: 5px 0; font-size: 15px; color: #7f8c8d;">🌐 <b>出口IP:</b> ${s.ip || '未知'}</p>
             <p style="margin: 5px 0; font-size: 15px; color: #7f8c8d;">🔑 <b>登录:</b> ${s.loginMethod}</p>`;
-            
+
         if (s.status.includes('Failed')) {
             htmlText += `<p style="margin: 5px 0; font-size: 15px; color: #e74c3c;">❌ <b>异常:</b> ${s.status}</p>`;
         } else {
@@ -157,13 +163,14 @@ async function sendNotifications(summaryArr) {
     const summary = [];
 
     for (const acc of accounts) {
-        const maskedUsername = maskEmail(acc.username);
+        const maskedUsername = maskEmail(acc.username); // workflow/控制台日志继续脱敏
         const accKey = `ACCOUNT_${acc.id}`;
         console.log(`\n===========================================`);
         console.log(`▶ 开始处理账号: ${maskedUsername} (ID: ${acc.id})`);
         
         let singBoxProcess = null, useProxy = false;
         let currentLoginMethod = '未知';
+        let exitIp = null; // 出口IP，明文只进 summary/通知，日志里脱敏打印
 
         if (acc.proxyUrl) {
             console.log(`🌐 解析代理 PROXY_URL_${acc.id}...`);
@@ -179,7 +186,7 @@ async function sendNotifications(summaryArr) {
             } catch (e) {
                 if (acc.proxyLock) {
                     console.log(`🚫 PROXY_LOCK 开启，放弃执行当前账号！`);
-                    summary.push({ user: maskedUsername, loginMethod: '未登录', status: 'Failed (代理失效)', stats: {}, latestDate: null });
+                    summary.push({ user: acc.username, loginMethod: '未登录', status: 'Failed (代理失效)', stats: {}, latestDate: null, ip: null });
                     continue; 
                 }
             }
@@ -211,8 +218,8 @@ async function sendNotifications(summaryArr) {
             console.log('🔍 验证连通性...');
             try {
                 await page.goto('https://api.ipify.org', { timeout: 20000 });
-                const ip = await page.innerText('body');
-                console.log(`✅ 网络就绪，出口 IP: ${maskIP(ip)}`);
+                exitIp = (await page.innerText('body')).trim();
+                console.log(`✅ 网络就绪，出口 IP: ${maskIP(exitIp)}`); // 日志继续脱敏
             } catch (e) { throw new Error(`网络不可达或代理断流`); }
 
             let loginSuccess = false;
@@ -240,12 +247,12 @@ async function sendNotifications(summaryArr) {
             const res = await manager.execute();
 
             globalState[accKey] = res.newState;
-            summary.push({ user: maskedUsername, loginMethod: currentLoginMethod, status: 'Success', stats: res.stats, latestDate: res.latestDueDate });
+            summary.push({ user: acc.username, loginMethod: currentLoginMethod, status: 'Success', stats: res.stats, latestDate: res.latestDueDate, ip: exitIp });
 
         } catch (e) {
             console.error(`❌ 异常: ${e.message}`);
             if (page) await page.screenshot({ path: `error_acc_${acc.id}_FINAL.png`, fullPage: true }).catch(()=>{});
-            summary.push({ user: maskedUsername, loginMethod: currentLoginMethod, status: `Failed: ${e.message}`, stats: {}, latestDate: null });
+            summary.push({ user: acc.username, loginMethod: currentLoginMethod, status: `Failed: ${e.message}`, stats: {}, latestDate: null, ip: exitIp });
         } finally {
             console.log('🧹 清理环境...');
             try { if (browser) await browser.close(); } catch(e){}
