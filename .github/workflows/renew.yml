@@ -1,0 +1,111 @@
+name: Hiden-cloud Auto Renew
+
+on:
+  schedule:
+    - cron: '20 23 * * *'
+    - cron: '15 11 * * *'
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 🏃 Inline Pre-check (Timestamp < 24h)
+        id: precheck
+        env:
+          SECRETS_CONTEXT: ${{ toJson(secrets) }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const now = Date.now();
+            let shouldRun = false;
+            let state = {};
+            
+            if (!fs.existsSync('./state.json')) {
+                console.log('state.json 不存在，初次运行。');
+                shouldRun = true;
+            } else {
+                try { state = JSON.parse(fs.readFileSync('./state.json', 'utf8')); } catch(e) { shouldRun = true; }
+            }
+            
+            if (!shouldRun) {
+                const secrets = JSON.parse(process.env.SECRETS_CONTEXT || '{}');
+                for (const key in secrets) {
+                    if (key.startsWith('HIDEN_ACCOUNT_')) {
+                        const id = key.replace('HIDEN_ACCOUNT_', '');
+                        const accKey = 'ACCOUNT_' + id; // 隐私匹配 ACCOUNT_1
+                        if (!state[accKey] || Object.keys(state[accKey]).length === 0) {
+                            shouldRun = true; break;
+                        }
+                        for (const svcHash in state[accKey]) {
+                            if (state[accKey][svcHash] - now <= 86400000) { // 距今不足 24 小时
+                                shouldRun = true; break;
+                            }
+                        }
+                    }
+                    if (shouldRun) break;
+                }
+            }
+            if (!shouldRun) console.log('✅ 所有账号距离到期均大于 24h，跳过执行。');
+            fs.appendFileSync(process.env.GITHUB_ENV, \`SHOULD_RUN=\${shouldRun}\n\`);
+          "
+
+      - name: Install Dependencies
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb
+          npm install
+          npx playwright install-deps chrome
+          
+          wget -qO sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.13.7/sing-box-1.13.7-linux-amd64.tar.gz
+          tar -xzf sing-box.tar.gz
+          mv sing-box-*/sing-box ./
+          chmod +x ./sing-box
+
+      - name: ⚙️ Load Environment Variables
+        if: env.SHOULD_RUN == 'true'
+        env:
+          VARS_JSON: ${{ toJson(vars) }}
+        run: |
+          node -e "
+            const v = JSON.parse(process.env.VARS_JSON || '{}');
+            const fs = require('fs');
+            for (const k in v) {
+              const val = v[k] || '';
+              fs.appendFileSync(process.env.GITHUB_ENV, \`\${k}<<EOF\n\${val}\nEOF\n\`);
+            }
+          "
+          echo "GITHUB_REPO=${{ github.repository }}" >> $GITHUB_ENV
+
+      - name: Run Main Action Script
+        if: env.SHOULD_RUN == 'true'
+        env: ${{ secrets }} 
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" npm start
+
+      - name: 📸 Upload Debug Screenshots
+        if: always() && env.SHOULD_RUN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: ./*.png
+          retention-days: 3
+
+      - name: Auto Commit state.json
+        if: env.SHOULD_RUN == 'true' && always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update state.json timestamps"
+          file_pattern: 'state.json'
