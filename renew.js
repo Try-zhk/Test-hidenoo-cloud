@@ -23,7 +23,7 @@ class RenewManager {
         if (this.csrfToken) headers['X-CSRF-TOKEN'] = this.csrfToken;
 
         return await this.page.evaluate(async ({ url, method, data, headers }) => {
-            const options = { method, headers, redirect: 'follow' };
+            const options = { method, headers, redirect: 'follow', cache: 'no-store' };
             if (data) options.body = data;
             const res = await fetch(url, options);
             return { status: res.status, finalUrl: res.url, data: await res.text() };
