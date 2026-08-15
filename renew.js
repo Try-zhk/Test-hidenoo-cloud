@@ -38,14 +38,18 @@ class RenewManager {
                 dueDateText = $(el).next('div').text().trim();
             }
         });
+        this.log(`🔎 [调试] 页面抓到的 Due Date 原文: "${dueDateText}"`);
         const MONTHS = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
         const match = dueDateText.match(/(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{4})/);
         if (match) {
             const month = MONTHS[match[2].toLowerCase()];
             if (month !== undefined) {
-                return Date.UTC(+match[3], month, +match[1]);
+                const ts = Date.UTC(+match[3], month, +match[1]);
+                this.log(`🔎 [调试] 解析结果: ${new Date(ts).toISOString()}`);
+                return ts;
             }
         }
+        this.log(`🔎 [调试] 解析失败，正则未匹配到日期`);
         return null;
     }
 
@@ -85,7 +89,7 @@ class RenewManager {
         await SLEEP(2000, 3000);
         
         const svcHash = crypto.createHash('md5').update(String(serviceId)).digest('hex').substring(0, 8);
-        this.log(`>>> 处理服务: [Hash-${svcHash}]`);
+        this.log(`>>> 处理服务: [Hash-${svcHash}] [原始ID:${serviceId}]`);
 
         const res = await this.request('GET', `/service/${serviceId}/manage`);
         const $ = cheerio.load(res.data);
@@ -97,6 +101,8 @@ class RenewManager {
         let finalDate = parsedDate;
         let needsRenew = true;
         if (parsedDate) {
+            const remainHours = ((parsedDate - Date.now()) / 3600000).toFixed(1);
+            this.log(`🔎 [调试] 剩余时间: ${remainHours} 小时`);
             if ((parsedDate - Date.now()) > 86400000) {
                 this.log(`⏭️ 剩余时间 > 24H，无需续期。`);
                 this.stats.skipped++;
