@@ -16,6 +16,19 @@ const STATE_FILE = './state.json';
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = 9222;
 
+// 等待调试端口真正释放（旧 Chrome 进程彻底退出），避免下一个账号 connectOverCDP 时连到上一个账号还没死透的进程上
+async function waitPortFree(port, maxTries = 10) {
+    for (let i = 0; i < maxTries; i++) {
+        try {
+            await axios.get(`http://localhost:${port}/json/version`, { timeout: 500 });
+            await new Promise(r => setTimeout(r, 500));
+        } catch (e) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function maskEmail(email) {
     if (!email || !email.includes('@')) return '***';
     const [name, domain] = email.split('@');
@@ -200,7 +213,8 @@ async function sendNotifications(summaryArr) {
         let browser, chromeProcess, page;
 
         try {
-            try { execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
+            try { execSync(`pkill -9 -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
+            await waitPortFree(DEBUG_PORT);
             chromeProcess = spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' });
             chromeProcess.unref();
 
@@ -256,7 +270,8 @@ async function sendNotifications(summaryArr) {
         } finally {
             console.log('🧹 清理环境...');
             try { if (browser) await browser.close(); } catch(e){}
-            try { execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
+            try { execSync(`pkill -9 -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
+            await waitPortFree(DEBUG_PORT);
             if (singBoxProcess && singBoxProcess.pid) {
                 try { process.kill(-singBoxProcess.pid); } catch(e) { try { execSync('pkill -f "sing-box run" || true'); } catch(err){} }
             }
