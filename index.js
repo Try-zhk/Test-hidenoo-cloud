@@ -30,12 +30,12 @@ function maskIP(ip) {
     return parts.length === 4 ? `${parts[0]}.${parts[1]}.***.***` : '***';
 }
 
-// 到期时间精确到秒，用于 TG/邮件通知（明文）
+// 到期时间只精确到天，用于 TG/邮件通知（明文）
 function formatDate(timestamp) {
     if (!timestamp) return '未知';
     const d = new Date(timestamp);
     const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
 function getAccounts() {
@@ -90,7 +90,7 @@ async function saveCookieToGitHub(id, cookiesArr) {
     } catch (e) { console.error(`❌ 保存 Cookie 失败:`, e.message); }
 }
 
-// TG / 邮件通知：明文账号 + 明文出口IP + 精确到秒的到期时间
+// TG / 邮件通知：明文账号 + 明文出口IP + 到期日期（精确到天）
 async function sendNotifications(summaryArr) {
     let mdText = `☁️ *HidenCloud 自动续期报告*\n━━━━━━━━━━━━━━━━━━\n`;
     let htmlText = `<div style="font-family: Arial, sans-serif; max-width: 650px; margin: auto; border: 1px solid #e0e0e0; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">

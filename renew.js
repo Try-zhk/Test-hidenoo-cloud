@@ -38,9 +38,13 @@ class RenewManager {
                 dueDateText = $(el).next('div').text().trim();
             }
         });
-        if (dueDateText) {
-            const timestamp = Date.parse(dueDateText);
-            if (!isNaN(timestamp)) return timestamp;
+        const MONTHS = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+        const match = dueDateText.match(/(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{4})/);
+        if (match) {
+            const month = MONTHS[match[2].toLowerCase()];
+            if (month !== undefined) {
+                return Date.UTC(+match[3], month, +match[1]);
+            }
         }
         return null;
     }
