@@ -136,62 +136,18 @@ class RenewManager {
             }
         }
 
-        this.log(`📅 点击 Renew...`);
-        const renewBtn = this.page.getByRole('button', { name: 'Renew' });
-        if ((await renewBtn.count()) !== 1) {
-            this.log('⚠️ 未找到唯一的 Renew 按钮（续期窗口未开放或页面改版）');
-            this.stats.failed++;
-            return finalDate;
-        }
-        await renewBtn.click();
+        this.log(`📅 进入续期流程...`);
+        const renewResult = await this.renewService(serviceId);
 
-        // 两种结果: 续期弹窗(Create Invoice) / Renewal Restricted
-        let outcome = null;
-        for (let i = 0; i < 10 && !outcome; i++) {
-            await this.page.waitForTimeout(1500);
-            try {
-                if (await this.page.getByText('Renewal Restricted').count()) outcome = 'restricted';
-                else if ((await this.page.getByRole('dialog').count()) === 1) {
-                    const t = await this.page.getByRole('dialog').innerText();
-                    if (t.includes('Create Invoice')) outcome = 'offer';
-                }
-            } catch (e) {}
-        }
-
-        if (outcome === 'restricted') {
+        if (renewResult === 'NOT_TIME') {
             this.log('⏭️ Renewal Restricted: 未到续期窗口，等下次运行。');
             this.stats.skipped++;
             return finalDate;
         }
-        if (outcome !== 'offer') {
-            this.log('⚠️ 点击 Renew 后未出现续期弹窗');
-            this.stats.failed++;
-            return finalDate;
-        }
 
-        const dialog = this.page.getByRole('dialog');
-        const dialogText = await dialog.innerText();
-        if (!dialogText.includes('€0.00')) {
-            this.log('⚠️ 续期弹窗不是免费续期，已中止');
-            this.stats.failed++;
-            return finalDate;
-        }
-
-        await dialog.getByRole('button', { name: 'Create Invoice' }).click();
-        let isPaid = false;
-        try {
-            await this.page.waitForURL(/\/payment\/invoice\//, { timeout: 45000 });
-            this.log(`⚡️ 账单已生成，前往支付`);
-            await this.page.waitForTimeout(2000);
-            isPaid = await this.payOnPage();
-        } catch (e) {
-            this.log('⚠️ 未跳转到账单页，检查未支付账单...');
-            isPaid = await this.checkUnpaidInvoices(serviceId);
-        }
-
-        if (isPaid) {
+        if (renewResult) {
             this.stats.success++;
-            this.log(`🔄 支付成功，重新刷新页面获取最新到期日...`);
+            this.log(`🔄 续期完成，重新刷新页面获取最新到期日...`);
             await SLEEP(2000, 3000);
             const refreshRes = await this.open(`/service/${serviceId}/manage`);
             const newDate = this.extractDate(refreshRes.data);
@@ -206,6 +162,174 @@ class RenewManager {
         return finalDate;
     }
 
+    // ===== Turnstile 辅助（流程对应 Auto-Renew-HidenCloud/app.py）=====
+    async tsState() {
+        try {
+            return await this.page.evaluate(() => {
+                let total = 0, solved = 0;
+                document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').forEach(n => {
+                    total++;
+                    if (n.value && n.value.length > 20) solved++;
+                });
+                return { total, solved };
+            });
+        } catch (e) { return { total: 0, solved: 0 }; }
+    }
+
+    cfFrameCount() {
+        try { return this.page.frames().filter(f => (f.url() || '').includes('challenges.cloudflare.com')).length; }
+        catch (e) { return 0; }
+    }
+
+    // 通过信号: successCheck 成立 / 出现新 token 且全部 widget 已解决 / 挑战框出现后消失 8s
+    // requirePositive=true 时，页面没出现 Turnstile 不会提前返回
+    async solveTurnstile(timeoutSec = 90, requirePositive = false, successCheck = null, shot = 'turnstile_timeout.png') {
+        this.log('🛡️ 处理 Turnstile...');
+        const start = Date.now();
+        const base = await this.tsState();
+        let hadFrame = false, goneSince = null;
+
+        while (Date.now() - start < timeoutSec * 1000) {
+            if (successCheck) {
+                try { if (await successCheck()) { this.log('✅ Turnstile 处理完成'); return true; } } catch (e) {}
+            }
+            const st = await this.tsState();
+            if (st.total > 0 && st.solved >= st.total && (st.total > base.total || st.solved > base.solved)) {
+                this.log(`✅ Turnstile 验证通过（token ${st.solved}/${st.total}）`);
+                return true;
+            }
+
+            if (this.cfFrameCount() > 0) {
+                hadFrame = true;
+                goneSince = null;
+                await attemptTurnstileCdp(this.page);
+                await this.page.waitForTimeout(2000 + Math.random() * 1500);
+            } else {
+                if (hadFrame) {
+                    if (!goneSince) goneSince = Date.now();
+                    else if (Date.now() - goneSince >= 8000) { this.log('✅ Turnstile 验证通过（挑战框已消失）'); return true; }
+                } else if (!requirePositive && !successCheck && Date.now() - start >= 5000) {
+                    this.log('ℹ️ 页面未出现 Turnstile，无需处理');
+                    return true;
+                }
+                await this.page.waitForTimeout(1000);
+            }
+        }
+        this.log(`❌ Turnstile 处理超时（${timeoutSec}s）`);
+        await this.page.screenshot({ path: shot }).catch(() => {});
+        return false;
+    }
+
+    // 返回 'NOT_TIME' / true / false
+    async renewService(serviceId) {
+        const svcPath = `/service/${serviceId}/manage`;
+        try {
+            if (!this.page.url().includes(svcPath)) await this.open(svcPath);
+
+            const renewBtn = this.page.locator('button:has-text("Renew")').first();
+            const createBtn = this.page.locator('button:has-text("Create Invoice")').first();
+
+            // 1. 点击 Renew，最多重试 6 次
+            let modalOpened = false;
+            for (let i = 0; i < 6; i++) {
+                try {
+                    await renewBtn.waitFor({ state: 'visible', timeout: 10000 });
+                    await renewBtn.scrollIntoViewIfNeeded();
+                    this.log(`🖱️ 第 ${i + 1} 次尝试点击 'Renew'...`);
+                    await renewBtn.click();
+
+                    await this.page.waitForTimeout(2000);
+                    const pageText = await this.page.locator('body').innerText();
+                    if (pageText.includes('Renewal Restricted') || pageText.toLowerCase().includes('can only renew')) {
+                        await this.page.screenshot({ path: 'renew_not_allowed.png' }).catch(() => {});
+                        return 'NOT_TIME';
+                    }
+
+                    this.log('🖲️ 等待弹窗出现...');
+                    try {
+                        await createBtn.waitFor({ state: 'visible', timeout: 5000 });
+                        modalOpened = true;
+                        this.log('✅ 弹窗已成功弹出！');
+                        break;
+                    } catch (e) {
+                        // 弹窗可能先展示 Turnstile，Create Invoice 稍后才出现
+                        if (this.cfFrameCount() > 0) {
+                            modalOpened = true;
+                            this.log('✅ 弹窗已弹出（先出现 Turnstile 验证）！');
+                            break;
+                        }
+                        this.log('⚠️ 弹窗未出现，可能是点击未响应，准备重试...');
+                        await this.page.waitForTimeout(2000);
+                    }
+                } catch (e) {
+                    this.log(`❌ 点击尝试出错: ${e.message.split('\n')[0]}`);
+                }
+            }
+            if (!modalOpened) {
+                this.log('❌ 尝试多次后，续费弹窗仍未出现。');
+                await this.page.screenshot({ path: 'renew_modal_failed.png' }).catch(() => {});
+                return false;
+            }
+
+            // 2. 弹窗内的 Turnstile：处理完再点 Create Invoice
+            this.log('🛡️ 处理弹窗内的 Turnstile...');
+            if (!(await this.solveTurnstile(90, true, null, 'modal_turnstile_fail.png'))) {
+                this.log("⚠️ 弹窗内 Turnstile 未确认通过，仍尝试点击 'Create Invoice'...");
+            }
+
+            await createBtn.waitFor({ state: 'visible', timeout: 30000 }).catch(() => {});
+
+            // 3. 点击 Create Invoice，最多 3 次
+            let createClicked = false;
+            for (let i = 0; i < 3; i++) {
+                try {
+                    this.log(`🖱️ 点击 'Create Invoice'（第 ${i + 1} 次）...`);
+                    await createBtn.click({ timeout: 8000 });
+                    createClicked = true;
+                    break;
+                } catch (e) {
+                    this.log(`⚠️ 点击 'Create Invoice' 失败: ${e.message.split('\n')[0]}`);
+                    await this.solveTurnstile(30, true);
+                }
+            }
+            if (!createClicked) {
+                this.log("❌ 无法点击 'Create Invoice'。");
+                await this.page.screenshot({ path: 'create_invoice_failed.png' }).catch(() => {});
+                return false;
+            }
+
+            // 4. 等待跳转到账单页（最多 90s，期间遇到 Turnstile 就处理）
+            let invoiceUrl = null;
+            const t0 = Date.now();
+            while (Date.now() - t0 < 90000) {
+                if (this.page.url().includes('/payment/invoice/')) { invoiceUrl = this.page.url(); break; }
+                if (this.cfFrameCount() > 0) {
+                    this.log('⚠️ 遇到拦截，尝试处理...');
+                    await this.solveTurnstile(45, false, () => this.page.url().includes('/payment/invoice/'));
+                    continue;
+                }
+                await this.page.waitForTimeout(1000);
+            }
+
+            if (!invoiceUrl) {
+                this.log('⚠️ 未能进入发票页面，检查未支付账单...');
+                await this.page.screenshot({ path: 'renew_stuck_invoice.png' }).catch(() => {});
+                return await this.checkUnpaidInvoices(serviceId);
+            }
+
+            this.log(`🎉 页面已跳转: ${invoiceUrl}`);
+            if (!(await this.waitCf())) throw new Error('账单页遇到拦截页面 (CF 验证超时)');
+            await this.page.waitForTimeout(2000);
+
+            // 5. 支付
+            return await this.payOnPage();
+        } catch (e) {
+            this.log(`❌ 续费异常: ${e.message.split('\n')[0]}`);
+            await this.page.screenshot({ path: 'renew_error.png' }).catch(() => {});
+            return false;
+        }
+    }
+
     // 在当前账单页点击 Pay（仅当所有 € 金额为 0 时）
     async payOnPage() {
         const text = await this.page.evaluate(() => document.body.innerText);
@@ -214,21 +338,20 @@ class RenewManager {
             .filter(n => Number.isFinite(n));
         if (amounts.some(n => n > 0)) { this.log('⚠️ 账单含非零金额，拒绝自动支付'); return false; }
 
-        const payBtn = this.page.getByRole('button', { name: 'Pay', exact: true });
-        if ((await payBtn.count()) !== 1) {
+        this.log('🔎 查找 Pay 按钮...');
+        const payBtn = this.page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first();
+        try {
+            await payBtn.waitFor({ state: 'visible', timeout: 30000 });
+        } catch (e) {
             this.log(`⚪ 未找到 Pay 按钮 (可能已支付)`);
+            await this.page.screenshot({ path: 'pay_btn_not_found.png' }).catch(() => {});
             return /payment has been completed|paid/i.test(text);
         }
         this.log(`💳 点击 Pay...`);
         await payBtn.click();
-        try {
-            await this.page.getByText(/payment has been completed/i).waitFor({ state: 'visible', timeout: 45000 });
-            this.log(`✅ 支付成功！`);
-            return true;
-        } catch (e) {
-            this.log(`⚠️ 未检测到支付成功提示`);
-            return false;
-        }
+        this.log(`✅ 'Pay' 按钮已点击。`);
+        await this.page.waitForTimeout(5000);
+        return true;
     }
 
     async checkUnpaidInvoices(serviceId) {
