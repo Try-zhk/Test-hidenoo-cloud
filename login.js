@@ -130,74 +130,161 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
-async function attemptSingleLogin(page, acc) {
-    await page.goto('https://dash.hidencloud.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log('⏳ 等待页面加载及检测 CF 盾...');
+const LOGIN_URL = 'https://dash.hidencloud.com/auth/login';
+const DASH_URL = 'https://dash.hidencloud.com/dashboard';
+const EMAIL_SEL = 'input[name="username"], input#username, input[name="email"], input[type="email"], input[name="EMAIL"]';
+const PWD_SEL = 'input[name="password"], input#password, input[name="PASSWORD"], input[type="password"]';
+const SUBMIT_SEL = 'button[type="submit"], button:has-text("Sign in"), button:has-text("Login"), button:has-text("登录")';
 
-    let isCfPassed = false;
-    for (let i = 0; i < 25; i++) {
-        const visible = await page.getByRole('textbox', { name: 'Email or Username' }).isVisible().catch(() => false);
-        if (visible) { isCfPassed = true; break; }
-        await attemptTurnstileCdp(page);
-        await page.waitForTimeout(2000);
+function cfFrameCount(page) {
+    try { return page.frames().filter(f => (f.url() || '').includes('challenges.cloudflare.com')).length; }
+    catch (e) { return 0; }
+}
+
+async function tsState(page) {
+    try {
+        return await page.evaluate(() => {
+            let total = 0, solved = 0;
+            document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').forEach(n => {
+                total++;
+                if (n.value && n.value.length > 20) solved++;
+            });
+            return { total, solved };
+        });
+    } catch (e) { return { total: 0, solved: 0 }; }
+}
+
+async function pageReady(page) {
+    try {
+        const t = ((await page.title()) || '').toLowerCase();
+        const blocked = ['just a moment', 'attention required', 'checking your browser', '请稍候', 'security verification', '请验证'];
+        return !!t && !blocked.some(k => t.includes(k));
+    } catch (e) { return false; }
+}
+
+// 通过信号: successCheck 成立 / 出现新 token 且全部 widget 已解决 / 挑战框出现后消失 8s
+// requirePositive=true: 页面没出现 Turnstile 不会提前返回
+// reloadAfter: 累计点击 N 次仍未通过则刷新页面重试（最多 2 次）
+async function solveTurnstile(page, { timeout = 90, requirePositive = false, successCheck = null, reloadAfter = 0, shot = 'turnstile_timeout.png' } = {}) {
+    console.log('🛡️ 开始处理 Turnstile...');
+    const start = Date.now();
+    const base = await tsState(page);
+    let hadFrame = false, goneSince = null, clickCount = 0, reloadDone = 0;
+
+    while (Date.now() - start < timeout * 1000) {
+        if (successCheck) {
+            try { if (await successCheck()) { console.log('✅ Turnstile 处理完成'); return true; } } catch (e) {}
+        }
+        const st = await tsState(page);
+        if (st.total > 0 && st.solved >= st.total && (st.total > base.total || st.solved > base.solved)) {
+            console.log(`✅ Turnstile 验证通过（token ${st.solved}/${st.total}）`);
+            return true;
+        }
+
+        if (cfFrameCount(page) > 0) {
+            hadFrame = true;
+            goneSince = null;
+            const clicked = await attemptTurnstileCdp(page);
+            if (clicked) {
+                clickCount++;
+                await page.waitForTimeout(4000 + Math.random() * 2000);
+            } else {
+                await page.waitForTimeout(1500 + Math.random() * 1000);
+            }
+
+            if (reloadAfter && clickCount >= reloadAfter && reloadDone < 2) {
+                reloadDone++;
+                console.log(`🔄 累计点击 ${clickCount} 次未通过，刷新页面重试（第 ${reloadDone}/2 次）...`);
+                clickCount = 0;
+                hadFrame = false;
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+                await page.waitForTimeout(3000 + Math.random() * 2000);
+            }
+        } else {
+            if (hadFrame) {
+                if (!goneSince) goneSince = Date.now();
+                else if (Date.now() - goneSince >= 8000) { console.log('✅ Turnstile 验证通过（挑战框已消失）'); return true; }
+            } else if (!requirePositive && !successCheck && Date.now() - start >= 5000) {
+                console.log('ℹ️ 页面未出现 Turnstile，无需处理');
+                return true;
+            }
+            await page.waitForTimeout(1000);
+        }
     }
-    if (!isCfPassed) throw new Error('无法突破初始 CF 验证盾，输入框未出现');
+    console.log(`❌ Turnstile 处理超时（${timeout}s）`);
+    await page.screenshot({ path: shot }).catch(() => {});
+    return false;
+}
+
+async function attemptSingleLogin(page, acc) {
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // --- 第一道 Turnstile：通过后才会显示账号密码输入框 ---
+    const formVisible = () => page.locator('input[type="password"]').first().isVisible().catch(() => false);
+    console.log('🛡️ 处理登录页第一道 Turnstile 验证...');
+    if (!(await solveTurnstile(page, { timeout: 180, successCheck: formVisible, reloadAfter: 8, shot: 'login_turnstile1_fail.png' }))) {
+        throw new Error('第一道 Turnstile 未通过，无法进入登录表单');
+    }
+
+    // --- 填写账号密码 ---
+    const emailBox = page.locator(EMAIL_SEL).first();
+    const passBox  = page.locator(PWD_SEL).first();
+    // Turnstile 通过后网关还会做几秒 "Validating security..." 才渲染表单
+    await emailBox.waitFor({ state: 'visible', timeout: 60000 });
 
     console.log('✅ 页面就绪！开始填写凭据...');
-    const emailBox = page.getByRole('textbox', { name: 'Email or Username' });
-    const passBox  = page.getByRole('textbox', { name: 'Password' });
-
     await emailBox.click();
     await page.waitForTimeout(300 + Math.random() * 200);
+    await emailBox.fill('');
     await emailBox.type(acc.username, { delay: 40 + Math.random() * 50 });
 
     await page.waitForTimeout(400 + Math.random() * 300);
     await passBox.click();
     await page.waitForTimeout(200 + Math.random() * 200);
+    await passBox.fill('');
     await passBox.type(acc.password, { delay: 40 + Math.random() * 50 });
 
-    console.log('🛡️ 正在等待 CF 盾注入验证 Token...');
-    let tokenReady = false;
-    for (let j = 0; j < 15; j++) {
-        const cfResponse = await page.evaluate(() => {
-            const el = document.querySelector('[name="cf-turnstile-response"]');
-            return el ? el.value : '';
-        });
-        
-        if (cfResponse && cfResponse.length > 20) {
-            console.log('✅ 成功获取到底层 CF Token，允许点击登录！');
-            tokenReady = true;
-            break;
-        }
-        await attemptTurnstileCdp(page);
-        await page.waitForTimeout(2000); 
-    }
-    
-    if (!tokenReady) {
-        console.log('⚠️ 警告：长时间未获取到 CF Token，尝试强行登录可能会失败。');
+    // --- 输入完成后等 8 秒，等第二道 Turnstile 出现 ---
+    console.log('⏳ 输入完成，等待第二道 Turnstile 加载...');
+    await page.waitForTimeout(8000);
+
+    console.log('🛡️ 处理第二道 Turnstile...');
+    if (!(await solveTurnstile(page, { timeout: 90, requirePositive: true, shot: 'login_turnstile2_fail.png' }))) {
+        console.log('⚠️ 第二道 Turnstile 未确认通过，仍尝试点击登录...');
     }
 
-    await page.waitForTimeout(500 + Math.random() * 300);
+    // --- 点击登录按钮 ---
     console.log('👆 点击登录按钮...');
-    await page.getByRole('button', { name: 'Sign in to your account' }).click();
-
-    console.log('⏳ 等待跳转控制台...');
     try {
-        await page.waitForURL('**/dashboard', { timeout: 35000 });
-        return true;
-    } catch (_) {}
-
-    for (let t = 0; t < 3; t++) {
-        if (page.url().includes('/dashboard')) return true;
-        if (await page.getByText('Incorrect password').isVisible().catch(() => false)) throw new Error('账号密码错误');
-        if (await page.getByText('cf-turnstile-response field is required').isVisible().catch(() => false)) throw new Error('CF 验证失效 (Token 被拒绝)');
-        
-        const clicked = await attemptTurnstileCdp(page);
-        await page.waitForTimeout(clicked ? 5000 : 3000);
+        await page.locator(SUBMIT_SEL).first().click({ timeout: 15000 });
+    } catch (e) {
+        await page.screenshot({ path: 'login_submit_fail.png' }).catch(() => {});
+        throw new Error('点击登录按钮失败');
     }
 
-    if (page.url().includes('/dashboard')) return true;
-    throw new Error('登录超时，可能遇到无反应的死盾');
+    // --- 提交后若再出现 Turnstile，边处理边等待跳转 ---
+    console.log('⏳ 等待跳转控制台...');
+    await page.waitForTimeout(2000);
+    const wrongPwd = () => page.getByText('Incorrect password').isVisible().catch(() => false);
+    const leftLogin = () => !page.url().includes('auth/login');
+    await solveTurnstile(page, {
+        timeout: 45,
+        successCheck: async () => leftLogin() || (await wrongPwd()),
+        shot: 'login_turnstile3_fail.png'
+    });
+    await page.waitForURL(u => !u.toString().includes('auth/login'), { timeout: 30000 }).catch(() => {});
+
+    if (!leftLogin()) {
+        if (await wrongPwd()) throw new Error('账号密码错误');
+        if (await page.getByText('cf-turnstile-response field is required').isVisible().catch(() => false)) throw new Error('CF 验证失效 (Token 被拒绝)');
+    }
+
+    // --- 进入 dashboard 确认登录态 ---
+    await page.goto(DASH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await solveTurnstile(page, { timeout: 60, successCheck: () => pageReady(page), reloadAfter: 8, shot: 'login_dashboard_cf_fail.png' });
+    console.log(`📝 当前Title: ${await page.title().catch(() => '')}`);
+    if (page.url().includes('auth/login')) throw new Error('登录失败，仍停留在登录页');
+    return true;
 }
 
 async function performLogin(page, acc) {
@@ -222,4 +309,4 @@ async function performLogin(page, acc) {
     }
 }
 
-module.exports = { performLogin };
+module.exports = { performLogin, attemptTurnstileCdp };
