@@ -248,6 +248,14 @@ async function challengeContainers(page) {
     return targets;
 }
 
+async function challengeBoxes(page) {
+    const frames = await challengeFrames(page);
+    const seen = frames.map(t => t[1]);
+    const targets = frames.slice();
+    for (const t of await challengeContainers(page)) if (!overlaps(t[1], seen)) targets.push(t);
+    return targets;
+}
+
 // 通过信号（任一满足）: successCheck 成立 / 出现新 token 且全部 widget 已解决 / 挑战框被处理后持续消失
 // requirePositive=true: 页面没出现 Turnstile 时不会提前返回
 // reloadAfter: 累计点击 N 次仍未通过则刷新页面重试（最多 2 次）
@@ -433,4 +441,4 @@ async function performLogin(page, acc) {
     }
 }
 
-module.exports = { performLogin, attemptTurnstileCdp, solveTurnstile, pageReady };
+module.exports = { performLogin, attemptTurnstileCdp, solveTurnstile, pageReady, challengeBoxes };

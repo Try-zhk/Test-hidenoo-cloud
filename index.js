@@ -207,7 +207,7 @@ async function sendNotifications(summaryArr) {
 
         if (!globalState[accKey]) globalState[accKey] = {};
         const userDataDir = path.join(os.tmpdir(), `chrome_data_${acc.id}`);
-        const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-first-run', '--disable-gpu', '--window-size=1280,720', '--no-sandbox', `--user-data-dir=${userDataDir}`];
+        const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-first-run', '--disable-gpu', '--window-size=1920,1080', '--no-sandbox', `--user-data-dir=${userDataDir}`];
         if (useProxy) args.push('--proxy-server=http://127.0.0.1:8080');
 
         let browser, chromeProcess, page;
