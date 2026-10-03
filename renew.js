@@ -1,6 +1,6 @@
 const cheerio = require('cheerio');
 const crypto = require('crypto');
-const { attemptTurnstileCdp } = require('./login.js');
+const { attemptTurnstileCdp, solveTurnstile: solveTs, pageReady } = require('./login.js');
 
 const SLEEP = (min = 3000, max = 5000) => new Promise(r => setTimeout(r, Math.floor(Math.random() * (max - min + 1)) + min));
 
@@ -162,62 +162,14 @@ class RenewManager {
         return finalDate;
     }
 
-    // ===== Turnstile 辅助（流程对应 Auto-Renew-HidenCloud/app.py）=====
-    async tsState() {
-        try {
-            return await this.page.evaluate(() => {
-                let total = 0, solved = 0;
-                document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').forEach(n => {
-                    total++;
-                    if (n.value && n.value.length > 20) solved++;
-                });
-                return { total, solved };
-            });
-        } catch (e) { return { total: 0, solved: 0 }; }
-    }
-
+    // ===== Turnstile 辅助：复用 login.js 里移植自 app.py 的 solveTurnstile =====
     cfFrameCount() {
         try { return this.page.frames().filter(f => (f.url() || '').includes('challenges.cloudflare.com')).length; }
         catch (e) { return 0; }
     }
 
-    // 通过信号: successCheck 成立 / 出现新 token 且全部 widget 已解决 / 挑战框出现后消失 8s
-    // requirePositive=true 时，页面没出现 Turnstile 不会提前返回
-    async solveTurnstile(timeoutSec = 90, requirePositive = false, successCheck = null, shot = 'turnstile_timeout.png') {
-        this.log('🛡️ 处理 Turnstile...');
-        const start = Date.now();
-        const base = await this.tsState();
-        let hadFrame = false, goneSince = null;
-
-        while (Date.now() - start < timeoutSec * 1000) {
-            if (successCheck) {
-                try { if (await successCheck()) { this.log('✅ Turnstile 处理完成'); return true; } } catch (e) {}
-            }
-            const st = await this.tsState();
-            if (st.total > 0 && st.solved >= st.total && (st.total > base.total || st.solved > base.solved)) {
-                this.log(`✅ Turnstile 验证通过（token ${st.solved}/${st.total}）`);
-                return true;
-            }
-
-            if (this.cfFrameCount() > 0) {
-                hadFrame = true;
-                goneSince = null;
-                await attemptTurnstileCdp(this.page);
-                await this.page.waitForTimeout(2000 + Math.random() * 1500);
-            } else {
-                if (hadFrame) {
-                    if (!goneSince) goneSince = Date.now();
-                    else if (Date.now() - goneSince >= 8000) { this.log('✅ Turnstile 验证通过（挑战框已消失）'); return true; }
-                } else if (!requirePositive && !successCheck && Date.now() - start >= 5000) {
-                    this.log('ℹ️ 页面未出现 Turnstile，无需处理');
-                    return true;
-                }
-                await this.page.waitForTimeout(1000);
-            }
-        }
-        this.log(`❌ Turnstile 处理超时（${timeoutSec}s）`);
-        await this.page.screenshot({ path: shot }).catch(() => {});
-        return false;
+    async solveTurnstile(timeoutSec = 90, requirePositive = false, successCheck = null, shot = 'turnstile_timeout.png', reloadAfter = 0) {
+        return solveTs(this.page, { timeout: timeoutSec, requirePositive, successCheck, shot, reloadAfter, log: m => this.log(m) });
     }
 
     // 返回 'NOT_TIME' / true / false
@@ -305,7 +257,7 @@ class RenewManager {
                 if (this.page.url().includes('/payment/invoice/')) { invoiceUrl = this.page.url(); break; }
                 if (this.cfFrameCount() > 0) {
                     this.log('⚠️ 遇到拦截，尝试处理...');
-                    await this.solveTurnstile(45, false, () => this.page.url().includes('/payment/invoice/'));
+                    await this.solveTurnstile(45, false, () => this.page.url().includes('/payment/invoice/'), 'turnstile_timeout.png');
                     continue;
                 }
                 await this.page.waitForTimeout(1000);
@@ -318,7 +270,7 @@ class RenewManager {
             }
 
             this.log(`🎉 页面已跳转: ${invoiceUrl}`);
-            if (!(await this.waitCf())) throw new Error('账单页遇到拦截页面 (CF 验证超时)');
+            await this.solveTurnstile(60, false, () => pageReady(this.page), 'invoice_cf_fail.png', 8);
             await this.page.waitForTimeout(2000);
 
             // 5. 支付

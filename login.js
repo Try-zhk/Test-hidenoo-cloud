@@ -136,9 +136,16 @@ const EMAIL_SEL = 'input[name="username"], input#username, input[name="email"], 
 const PWD_SEL = 'input[name="password"], input#password, input[name="PASSWORD"], input[type="password"]';
 const SUBMIT_SEL = 'button[type="submit"], button:has-text("Sign in"), button:has-text("Login"), button:has-text("登录")';
 
-function cfFrameCount(page) {
-    try { return page.frames().filter(f => (f.url() || '').includes('challenges.cloudflare.com')).length; }
-    catch (e) { return 0; }
+// ================= Turnstile 处理（移植自 Auto-Renew-HidenCloud/app.py）=================
+// 新版 Turnstile 的挑战 iframe 可能在闭包 shadow DOM 里，querySelector 找不到，
+// 但 page.frames() 能看到，frameElement() 能拿到元素；隐藏 token 输入框一定在 light DOM，可作兜底定位。
+// 点击：首选 frameElement.click(position)，失败再用 CDP 底层鼠标事件兜底。
+const TS_MARKER = 'challenges.cloudflare.com';
+const TS_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare"]';
+const cdpSessions = new WeakMap();
+
+function overlaps(box, boxes, dx = 25, dy = 25, dw = 60) {
+    return boxes.some(b => Math.abs(b.x - box.x) < dx && Math.abs(b.y - box.y) < dy && Math.abs(b.width - box.width) < dw);
 }
 
 async function tsState(page) {
@@ -162,57 +169,174 @@ async function pageReady(page) {
     } catch (e) { return false; }
 }
 
-// 通过信号: successCheck 成立 / 出现新 token 且全部 widget 已解决 / 挑战框出现后消失 8s
-// requirePositive=true: 页面没出现 Turnstile 不会提前返回
+async function cdpClickAt(page, x, y, log) {
+    try {
+        let session = cdpSessions.get(page);
+        if (!session) {
+            session = await page.context().newCDPSession(page);
+            cdpSessions.set(page, session);
+        }
+        const sx = x - (50 + Math.random() * 60);
+        const sy = y - (35 + Math.random() * 40);
+        const steps = 8 + Math.floor(Math.random() * 7);
+        for (let i = 1; i <= steps; i++) {
+            const ix = sx + (x - sx) * i / steps + (Math.random() * 3 - 1.5);
+            const iy = sy + (y - sy) * i / steps + (Math.random() * 3 - 1.5);
+            await session.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: ix, y: iy });
+            await page.waitForTimeout(10 + Math.random() * 25);
+        }
+        await page.waitForTimeout(100 + Math.random() * 150);
+        await session.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+        await page.waitForTimeout(50 + Math.random() * 70);
+        await session.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+        return true;
+    } catch (e) {
+        log(`⚠️ CDP 底层点击失败: ${e.message.split('\n')[0]}`);
+        try { const s = cdpSessions.get(page); if (s) await s.detach(); } catch (e2) {}
+        cdpSessions.delete(page);
+        return false;
+    }
+}
+
+async function challengeFrames(page) {
+    const targets = [], seen = [];
+    try {
+        for (const f of page.frames()) {
+            if (!(f.url() || '').includes(TS_MARKER)) continue;
+            try {
+                const fe = await f.frameElement();
+                if (await fe.isVisible()) {
+                    const box = await fe.boundingBox();
+                    if (box && box.width > 10 && box.height > 10) { seen.push(box); targets.push([fe, box]); }
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+    try {
+        const els = await page.locator(TS_IFRAME_SEL).all();
+        for (const el of els) {
+            try {
+                if (!(await el.isVisible())) continue;
+                const box = await el.boundingBox();
+                if (box && box.width > 10 && box.height > 10 && !overlaps(box, seen)) { seen.push(box); targets.push([el, box]); }
+            } catch (e) {}
+        }
+    } catch (e) {}
+    return targets;
+}
+
+async function challengeContainers(page) {
+    const targets = [];
+    try {
+        const els = await page.locator('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').all();
+        for (const el of els) {
+            try {
+                if (await el.evaluate(n => !!(n.value && n.value.length > 20))) continue;
+                const box = await el.evaluate(n => {
+                    let p = n.parentElement;
+                    for (let i = 0; i < 4 && p; i++) {
+                        const r = p.getBoundingClientRect();
+                        if (r.width > 40 && r.height > 20) return { x: r.x, y: r.y, width: r.width, height: r.height };
+                        p = p.parentElement;
+                    }
+                    return null;
+                });
+                if (box && !overlaps(box, targets.map(t => t[1]))) targets.push([null, box]);
+            } catch (e) {}
+        }
+    } catch (e) {}
+    return targets;
+}
+
+// 通过信号（任一满足）: successCheck 成立 / 出现新 token 且全部 widget 已解决 / 挑战框被处理后持续消失
+// requirePositive=true: 页面没出现 Turnstile 时不会提前返回
 // reloadAfter: 累计点击 N 次仍未通过则刷新页面重试（最多 2 次）
-async function solveTurnstile(page, { timeout = 90, requirePositive = false, successCheck = null, reloadAfter = 0, shot = 'turnstile_timeout.png' } = {}) {
-    console.log('🛡️ 开始处理 Turnstile...');
+async function solveTurnstile(page, { timeout = 120, successCheck = null, requirePositive = false, appearGrace = 5, reloadAfter = 0, shot = 'turnstile_timeout.png', log = console.log } = {}) {
+    log('🛡️ 开始处理 Turnstile...');
     const start = Date.now();
     const base = await tsState(page);
-    let hadFrame = false, goneSince = null, clickCount = 0, reloadDone = 0;
+    let hadIframe = false, goneSince = null, containerOnlySince = null, clickCount = 0, reloadDone = 0;
 
     while (Date.now() - start < timeout * 1000) {
         if (successCheck) {
-            try { if (await successCheck()) { console.log('✅ Turnstile 处理完成'); return true; } } catch (e) {}
+            try { if (await successCheck()) { log('✅ Turnstile 验证通过！'); return true; } } catch (e) {}
         }
+
         const st = await tsState(page);
         if (st.total > 0 && st.solved >= st.total && (st.total > base.total || st.solved > base.solved)) {
-            console.log(`✅ Turnstile 验证通过（token ${st.solved}/${st.total}）`);
+            log(`✅ Turnstile 验证通过（token 已生成 ${st.solved}/${st.total}）！`);
             return true;
         }
 
-        if (cfFrameCount(page) > 0) {
-            hadFrame = true;
-            goneSince = null;
-            const clicked = await attemptTurnstileCdp(page);
-            if (clicked) {
-                clickCount++;
-                await page.waitForTimeout(4000 + Math.random() * 2000);
-            } else {
-                await page.waitForTimeout(1500 + Math.random() * 1000);
-            }
+        const frames = await challengeFrames(page);
+        const seen = frames.map(t => t[1]);
+        const targets = frames.concat((await challengeContainers(page)).filter(t => !overlaps(t[1], seen)));
 
-            if (reloadAfter && clickCount >= reloadAfter && reloadDone < 2) {
-                reloadDone++;
-                console.log(`🔄 累计点击 ${clickCount} 次未通过，刷新页面重试（第 ${reloadDone}/2 次）...`);
-                clickCount = 0;
-                hadFrame = false;
-                await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-                await page.waitForTimeout(3000 + Math.random() * 2000);
-            }
+        if (frames.length) {
+            hadIframe = true; goneSince = null; containerOnlySince = null;
+        } else if (targets.length) {
+            hadIframe = true; goneSince = null;
+            if (!containerOnlySince) containerOnlySince = Date.now();
+            else if (Date.now() - containerOnlySince >= 12000) { log('✅ Turnstile 验证通过（挑战已结束）！'); return true; }
         } else {
-            if (hadFrame) {
+            containerOnlySince = null;
+            if (hadIframe) {
                 if (!goneSince) goneSince = Date.now();
-                else if (Date.now() - goneSince >= 8000) { console.log('✅ Turnstile 验证通过（挑战框已消失）'); return true; }
-            } else if (!requirePositive && !successCheck && Date.now() - start >= 5000) {
-                console.log('ℹ️ 页面未出现 Turnstile，无需处理');
+                else if (Date.now() - goneSince >= 8000) { log('✅ Turnstile 验证通过（挑战框已消失）！'); return true; }
+            } else if (!requirePositive && !successCheck && Date.now() - start >= appearGrace * 1000) {
+                log('ℹ️ 页面未出现 Turnstile，无需处理');
                 return true;
             }
             await page.waitForTimeout(1000);
+            continue;
+        }
+
+        // 逐个点击挑战框：Playwright 定点点击为主，CDP 底层点击兜底
+        for (const [el, box] of targets) {
+            let clicked = false;
+            try {
+                const offX = Math.min(30, box.width / 2);
+                const posY = box.height / 2;
+                if (el) {
+                    try { await el.scrollIntoViewIfNeeded({ timeout: 3000 }); } catch (e) {}
+                    try {
+                        await el.click({ position: { x: offX, y: posY }, timeout: 5000 });
+                        clicked = true;
+                        log(`🖱️ 点击 Turnstile 验证 (${Math.round(box.x + offX)}, ${Math.round(box.y + posY)}) ...`);
+                    } catch (e) {
+                        log('⚠️ 挑战框点击失败,尝试底层点击...');
+                    }
+                }
+                if (!clicked) {
+                    const cx = box.x + offX + (Math.random() * 4 - 2);
+                    const cy = box.y + posY + (Math.random() * 4 - 2);
+                    log(`🖱️ CDP 底层点击 Turnstile (${Math.round(cx)}, ${Math.round(cy)}) ...`);
+                    clicked = await cdpClickAt(page, cx, cy, log);
+                }
+            } catch (e) {
+                log(`⚠️ 点击挑战框出错: ${e.message.split('\n')[0]}`);
+            }
+            clickCount++;
+            await page.waitForTimeout(4000 + Math.random() * 2000);
+        }
+
+        if (reloadAfter && clickCount >= reloadAfter && reloadDone < 2) {
+            reloadDone++;
+            log(`🔄 累计点击 ${clickCount} 次未通过，刷新页面重试（第 ${reloadDone}/2 次）...`);
+            clickCount = 0; hadIframe = false; goneSince = null; containerOnlySince = null;
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => log(`⚠️ 刷新失败: ${e.message.split('\n')[0]}`));
+            await page.waitForTimeout(3000 + Math.random() * 2000);
         }
     }
-    console.log(`❌ Turnstile 处理超时（${timeout}s）`);
-    await page.screenshot({ path: shot }).catch(() => {});
+
+    log(`❌ Turnstile 处理超时（${timeout}s）`);
+    try {
+        const cf = page.frames().filter(f => (f.url() || '').includes(TS_MARKER)).map(f => f.url().slice(0, 100));
+        const st = await tsState(page);
+        log(`🔍 超时现场: cf_frames=${cf.length} token=${JSON.stringify(st)} title=${JSON.stringify(await page.title())}`);
+        await page.screenshot({ path: shot });
+        log(`📸 已保存超时截图: ${shot}`);
+    } catch (e) {}
     return false;
 }
 
@@ -309,4 +433,4 @@ async function performLogin(page, acc) {
     }
 }
 
-module.exports = { performLogin, attemptTurnstileCdp };
+module.exports = { performLogin, attemptTurnstileCdp, solveTurnstile, pageReady };
