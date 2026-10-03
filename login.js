@@ -441,4 +441,4 @@ async function performLogin(page, acc) {
     }
 }
 
-module.exports = { performLogin, attemptTurnstileCdp, solveTurnstile, pageReady, challengeBoxes };
+module.exports = { performLogin, attemptTurnstileCdp, solveTurnstile, pageReady, challengeBoxes, tsState };

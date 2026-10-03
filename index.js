@@ -12,6 +12,29 @@ const { RenewManager } = require('./renew.js');
 
 chromium.use(stealth);
 
+const STEALTH_JS = `
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || {};
+window.chrome.runtime = window.chrome.runtime || {};
+window.chrome.loadTimes = window.chrome.loadTimes || function () { return {}; };
+window.chrome.csi = window.chrome.csi || function () { return {}; };
+if (!window.chrome.app) {
+  window.chrome.app = { isInstalled: false,
+    InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+    RunningState: { CANT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } };
+}
+try {
+  const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (origQuery) {
+    window.navigator.permissions.query = (p) =>
+      (p && p.name === 'notifications')
+        ? Promise.resolve({ state: (window.Notification && Notification.permission) || 'prompt' })
+        : origQuery(p);
+  }
+} catch (e) {}
+`;
+
+
 const STATE_FILE = './state.json';
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = 9222;
@@ -207,7 +230,7 @@ async function sendNotifications(summaryArr) {
 
         if (!globalState[accKey]) globalState[accKey] = {};
         const userDataDir = path.join(os.tmpdir(), `chrome_data_${acc.id}`);
-        const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-first-run', '--disable-gpu', '--window-size=1920,1080', '--no-sandbox', `--user-data-dir=${userDataDir}`];
+        const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-first-run', '--disable-gpu', '--window-size=1920,1080', '--disable-blink-features=AutomationControlled', '--disable-infobars', '--no-sandbox', `--user-data-dir=${userDataDir}`];
         if (useProxy) args.push('--proxy-server=http://127.0.0.1:8080');
 
         let browser, chromeProcess, page;
@@ -227,6 +250,7 @@ async function sendNotifications(summaryArr) {
 
             browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
             page = await browser.contexts()[0].newPage();
+            await page.addInitScript(STEALTH_JS);
             page.setDefaultTimeout(60000);
 
             console.log('🔍 验证连通性...');

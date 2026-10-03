@@ -1,6 +1,6 @@
 const cheerio = require('cheerio');
 const crypto = require('crypto');
-const { solveTurnstile: solveTs, pageReady, challengeBoxes } = require('./login.js');
+const { solveTurnstile: solveTs, pageReady, challengeBoxes, tsState } = require('./login.js');
 
 const SLEEP = (min = 3000, max = 5000) => new Promise(r => setTimeout(r, Math.floor(Math.random() * (max - min + 1)) + min));
 
@@ -249,7 +249,7 @@ class RenewManager {
                     this.log(`🎉 页面已跳转: ${newInvoiceUrl}`);
                     break;
                 }
-                if ((await this.page.locator('iframe[src*="challenges.cloudflare.com"]').count()) > 0) {
+                if ((await challengeBoxes(this.page)).length > 0) {
                     this.log('⚠️ 遇到拦截，尝试处理...');
                     await this.solveTurnstile(45, false, null, 'turnstile_timeout.png', 8);
                 }
@@ -258,6 +258,13 @@ class RenewManager {
 
             if (!newInvoiceUrl) {
                 this.log('❌ 未能进入发票页面，超时。');
+                try {
+                    const modalVisible = await createBtn.isVisible().catch(() => false);
+                    const alerts = await this.page.evaluate(() => Array.from(document.querySelectorAll('[role="alert"], .alert, .text-red-500, .text-red-600, .text-danger, .invalid-feedback'))
+                        .filter(e => e.offsetParent !== null)
+                        .map(e => (e.innerText || '').trim().slice(0, 100)).filter(Boolean).slice(0, 3));
+                    this.log(`🔍 卡住现场: url=${this.page.url().replace(/\d+/g, '*')} CreateInvoice按钮可见=${modalVisible} token=${JSON.stringify(await tsState(this.page))} 页面提示=${JSON.stringify(alerts)}`);
+                } catch (e) {}
                 await this.page.screenshot({ path: 'renew_stuck_invoice.png' }).catch(() => {});
                 return false;
             }
