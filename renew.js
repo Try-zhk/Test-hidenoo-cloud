@@ -1,6 +1,6 @@
 const cheerio = require('cheerio');
 const crypto = require('crypto');
-const { attemptTurnstileCdp, solveTurnstile: solveTs, pageReady } = require('./login.js');
+const { attemptTurnstileCdp, solveTurnstile: solveTs, pageReady, tsState } = require('./login.js');
 
 const SLEEP = (min = 3000, max = 5000) => new Promise(r => setTimeout(r, Math.floor(Math.random() * (max - min + 1)) + min));
 
@@ -172,6 +172,51 @@ class RenewManager {
         return solveTs(this.page, { timeout: timeoutSec, requirePositive, successCheck, shot, reloadAfter, log: m => this.log(m) });
     }
 
+    async clickCreateInvoice(btn, n) {
+        try {
+            await btn.click({ timeout: 8000 });
+            return true;
+        } catch (e) {
+            this.log(`⚠️ 普通点击失败: ${e.message.split('\n').slice(0, 4).join(' | ')}`);
+        }
+
+        // 诊断：按钮状态 + 按钮中心点实际被哪个元素盖住
+        try {
+            const info = await btn.evaluate(el => {
+                const r = el.getBoundingClientRect();
+                const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                return {
+                    disabled: el.disabled, ariaDisabled: el.getAttribute('aria-disabled'),
+                    rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+                    viewport: [innerWidth, innerHeight],
+                    topEl: top ? (top.tagName + '.' + String(top.className || '').slice(0, 60)) : null,
+                    topIsSelf: !!top && (top === el || el.contains(top)),
+                    matches: document.querySelectorAll('button').length
+                };
+            });
+            this.log(`🔍 按钮诊断: ${JSON.stringify(info)}`);
+        } catch (e) {
+            this.log(`🔍 按钮诊断失败: ${e.message.split('\n')[0]}`);
+        }
+        await this.page.screenshot({ path: `create_invoice_click_fail_${n}.png` }).catch(() => {});
+
+        try {
+            await btn.click({ force: true, timeout: 5000 });
+            this.log('✅ force 点击已执行');
+            return true;
+        } catch (e) {
+            this.log(`⚠️ force 点击失败: ${e.message.split('\n')[0]}`);
+        }
+        try {
+            await btn.evaluate(el => el.click());
+            this.log('✅ JS 点击已执行');
+            return true;
+        } catch (e) {
+            this.log(`⚠️ JS 点击失败: ${e.message.split('\n')[0]}`);
+        }
+        return false;
+    }
+
     // 返回 'NOT_TIME' / true / false
     async renewService(serviceId) {
         const svcPath = `/service/${serviceId}/manage`;
@@ -231,18 +276,14 @@ class RenewManager {
 
             await createBtn.waitFor({ state: 'visible', timeout: 30000 }).catch(() => {});
 
-            // 3. 点击 Create Invoice，最多 3 次
+            // 3. 点击 Create Invoice，最多 3 次（普通点击失败会打印诊断，并依次尝试 force / JS 点击）
             let createClicked = false;
             for (let i = 0; i < 3; i++) {
-                try {
-                    this.log(`🖱️ 点击 'Create Invoice'（第 ${i + 1} 次）...`);
-                    await createBtn.click({ timeout: 8000 });
-                    createClicked = true;
-                    break;
-                } catch (e) {
-                    this.log(`⚠️ 点击 'Create Invoice' 失败: ${e.message.split('\n')[0]}`);
-                    await this.solveTurnstile(30, true);
-                }
+                this.log(`🖱️ 点击 'Create Invoice'（第 ${i + 1} 次）...`);
+                if (await this.clickCreateInvoice(createBtn, i + 1)) { createClicked = true; break; }
+                // token 已经有效就不再重复点验证框，避免把已通过的验证弄失效
+                const st = await tsState(this.page);
+                if (!(st.total > 0 && st.solved >= st.total)) await this.solveTurnstile(30, true);
             }
             if (!createClicked) {
                 this.log("❌ 无法点击 'Create Invoice'。");
