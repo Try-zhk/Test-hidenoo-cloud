@@ -305,7 +305,10 @@ async function solveTurnstile(page, { timeout = 120, successCheck = null, requir
             try {
                 const offX = Math.min(30, box.width / 2);
                 const posY = box.height / 2;
-                if (el) {
+                // 日志显示：Playwright 点击在外部 CDP 连接的 Chrome 上可能“点了但没生效”，
+                // 而 CDP 底层点击生效过，所以奇数次改用 CDP 底层点击，两种方式轮流尝试
+                const useCdpOnly = clickCount % 2 === 1;
+                if (el && !useCdpOnly) {
                     try { await el.scrollIntoViewIfNeeded({ timeout: 3000 }); } catch (e) {}
                     try {
                         await el.click({ position: { x: offX, y: posY }, timeout: 5000 });
