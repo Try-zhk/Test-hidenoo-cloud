@@ -93,7 +93,7 @@ jobs:
       - name: Run Main Action Script
         if: env.SHOULD_RUN == 'true'
         env: ${{ secrets }} 
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" npm start
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" npm start
 
       - name: 📸 Upload Debug Screenshots
         if: always() && env.SHOULD_RUN == 'true'
