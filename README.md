@@ -29,6 +29,13 @@ SMTP_CONFIG
 
 # EMAIL_CHAT
 EMAIL_CHAT=recipient@example.com
+
+# WXPUSH_API
+WXPUSH_API=your_wxpush_adress
+
+# WXPUSH_TOKEN
+WXPUSH_TOKEN=your_wxpush_token
+
 ```
 
 ## 🔐 GitHub PAT (Required for Auto Cookie Writing)

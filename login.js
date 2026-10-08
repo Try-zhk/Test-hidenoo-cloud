@@ -1,6 +1,8 @@
 const INJECTED_SCRIPT = `
 (function() {
     if (window.self === window.top) return;
+    if (window.__turnstile_hook_installed) return;
+    window.__turnstile_hook_installed = true;
 
     const fixedScreenX = 800 + Math.floor(Math.random() * 400);
     const fixedScreenY = 400 + Math.floor(Math.random() * 200);
@@ -123,7 +125,7 @@ async function attemptTurnstileCdp(page) {
             await humanLikeClick(client, clickX, clickY);
             await client.detach();
 
-            await frame.evaluate(() => { window.__turnstile_state = 'clicked'; window.__turnstile_data  = null; }).catch(() => {});
+            await frame.evaluate(() => { window.__turnstile_state = 'clicked'; }).catch(() => {});
             return true;
         } catch (e) {}
     }
@@ -222,4 +224,4 @@ async function performLogin(page, acc) {
     }
 }
 
-module.exports = { performLogin };
+module.exports = { performLogin, attemptTurnstileCdp, INJECTED_SCRIPT };

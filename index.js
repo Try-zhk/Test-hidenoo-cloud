@@ -7,7 +7,7 @@ const path = require('path');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
 
-const { performLogin } = require('./login.js');
+const { performLogin, INJECTED_SCRIPT } = require('./login.js');
 const { RenewManager } = require('./renew.js');
 
 chromium.use(stealth);
@@ -15,19 +15,6 @@ chromium.use(stealth);
 const STATE_FILE = './state.json';
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = 9222;
-
-// 等待调试端口真正释放（旧 Chrome 进程彻底退出），避免下一个账号 connectOverCDP 时连到上一个账号还没死透的进程上
-async function waitPortFree(port, maxTries = 10) {
-    for (let i = 0; i < maxTries; i++) {
-        try {
-            await axios.get(`http://localhost:${port}/json/version`, { timeout: 500 });
-            await new Promise(r => setTimeout(r, 500));
-        } catch (e) {
-            return true;
-        }
-    }
-    return false;
-}
 
 function maskEmail(email) {
     if (!email || !email.includes('@')) return '***';
@@ -40,15 +27,20 @@ function maskEmail(email) {
 function maskIP(ip) {
     if (!ip) return '***.***.***.***';
     const parts = ip.trim().split('.');
-    return parts.length === 4 ? `${parts[0]}.${parts[1]}.***.***` : '***';
+    return parts.length === 4 ? `${parts[0]}.***.***.${parts[3]}` : '***';
 }
 
-// 到期时间只精确到天，用于 TG/邮件通知（明文）
 function formatDate(timestamp) {
     if (!timestamp) return '未知';
-    const d = new Date(timestamp);
-    const pad = n => String(n).padStart(2, '0');
-    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+    return new Date(timestamp).toISOString().split('T')[0];
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
 function getAccounts() {
@@ -81,7 +73,6 @@ function getSmtpConfig() {
         const portMatch = str.match(/port['"]?\s*:\s*(\d+)/i);
         const userMatch = str.match(/user['"]?\s*:\s*['"]([^'"]+)['"]/i) || str.match(/user\s*:\s*([^,\s}]+)/i);
         const passMatch = str.match(/pass['"]?\s*:\s*['"]([^'"]+)['"]/i) || str.match(/pass\s*:\s*([^,\s}]+)/i);
-
         if (hostMatch && userMatch && passMatch) {
             return { host: hostMatch[1], port: portMatch ? parseInt(portMatch[1]) : 587, user: userMatch[1], pass: passMatch[1] };
         }
@@ -103,9 +94,86 @@ async function saveCookieToGitHub(id, cookiesArr) {
     } catch (e) { console.error(`❌ 保存 Cookie 失败:`, e.message); }
 }
 
-// TG / 邮件通知：明文账号 + 明文出口IP + 到期日期（精确到天）
+async function sendWxPush(summaryArr) {
+    const wxApi   = process.env.WXPUSH_API;
+    const wxToken = process.env.WXPUSH_TOKEN;
+    if (!wxApi || !wxToken) {
+        console.log('⏭️ 未配置 WXPUSH_API / WXPUSH_TOKEN，跳过 WxPush 通知');
+        return;
+    }
+
+    const lines = summaryArr.map(s => {
+        const header = `👤 ${s.user}  🔑 ${s.loginMethod}`;
+        if (s.status.includes('Failed')) {
+            return `${header}\n❌ 异常: ${s.status}`;
+        }
+        return [
+            header,
+            `⚡ 续期: ${s.stats.success} 成功 / ${s.stats.skipped} 未到期 / ${s.stats.failed} 失败`,
+            `📅 最新到期: ${formatDate(s.latestDate)}`
+        ].join('\n');
+    });
+
+    const title   = '☁️ HidenCloud 自动续期报告';
+    const content = lines.join('\n──────────────\n');
+
+    try {
+        const res = await axios.post(
+            `${wxApi.replace(/\/$/, '')}/wxsend`,
+            { title, content },
+            {
+                headers: {
+                    'Authorization': wxToken,
+                    'Content-Type':  'application/json'
+                },
+                timeout: 15000
+            }
+        );
+        console.log(`✅ WxPush 通知已发送: ${res.data?.msg || res.status}`);
+    } catch (e) {
+        console.error(`❌ WxPush 通知失败: ${e.response?.data?.msg || e.message}`);
+    }
+}
+
 async function sendNotifications(summaryArr) {
-    let mdText = `☁️ *HidenCloud 自动续期报告*\n━━━━━━━━━━━━━━━━━━\n`;
+    // ── Telegram ──
+    if (process.env.TG_TOKEN && process.env.TG_CHAT) {
+        let tgHtml = `☁️ <b>HidenCloud 自动续期报告</b>\n━━━━━━━━━━━━━━━━━━\n`;
+
+        summaryArr.forEach(s => {
+            tgHtml += `👤 <b>账号:</b> <code>${escapeHtml(s.user)}</code>\n`;
+            tgHtml += `🔑 <b>登录:</b> ${escapeHtml(s.loginMethod)}\n`;
+            if (s.status.includes('Failed')) {
+                tgHtml += `❌ <b>异常:</b> ${escapeHtml(s.status)}\n`;
+            } else {
+                tgHtml += `⚡ <b>续期:</b> ${s.stats.success} 成功 / ${s.stats.skipped} 未到期 / ${s.stats.failed} 失败\n`;
+                tgHtml += `📅 <b>到期:</b> ${formatDate(s.latestDate)}\n`;
+            }
+            tgHtml += `━━━━━━━━━━━━━━━━━━\n`;
+        });
+
+        try {
+            await axios.post(
+                `https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`,
+                {
+                    chat_id: process.env.TG_CHAT,
+                    text: tgHtml,
+                    parse_mode: 'HTML'
+                },
+                { timeout: 15000 }
+            );
+            console.log('✅ Telegram 通知已发送');
+        } catch (e) {
+            const detail = e.response?.data
+                ? JSON.stringify(e.response.data)
+                : e.message;
+            console.error(`❌ Telegram 通知失败: ${detail}`);
+        }
+    } else {
+        console.log('⏭️ 未配置 TG_TOKEN / TG_CHAT，跳过 Telegram 通知');
+    }
+
+    // ── Email ──
     let htmlText = `<div style="font-family: Arial, sans-serif; max-width: 650px; margin: auto; border: 1px solid #e0e0e0; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
         <div style="background-color: #2c3e50; padding: 20px; text-align: center;">
             <h2 style="color: #ffffff; margin: 0; font-size: 24px;">☁️ HidenCloud 自动续期</h2>
@@ -113,28 +181,15 @@ async function sendNotifications(summaryArr) {
         <div style="padding: 20px; background-color: #fcfcfc;">`;
 
     summaryArr.forEach(s => {
-        mdText += `👤 **账号**: \`${s.user}\`\n`;
-        mdText += `🌐 **出口IP**: \`${s.ip || '未知'}\`\n`;
-        mdText += `🔑 **登录**: ${s.loginMethod}\n`;
-        if (s.status.includes('Failed')) {
-            mdText += `❌ **异常**: ${s.status}\n`;
-        } else {
-            mdText += `⚡ **续期**: ${s.stats.success} 成功 / ${s.stats.skipped} 未到期 / ${s.stats.failed} 失败\n`;
-            mdText += `📅 **到期**: ${formatDate(s.latestDate)}\n`;
-        }
-        mdText += `━━━━━━━━━━━━━━━━━━\n`;
-
         htmlText += `<div style="background: #ffffff; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 5px solid ${s.status.includes('Failed') ? '#e74c3c' : '#2ecc71'}; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
             <p style="margin: 5px 0; font-size: 16px;">👤 <b>账号:</b> ${s.user}</p>
-            <p style="margin: 5px 0; font-size: 15px; color: #7f8c8d;">🌐 <b>出口IP:</b> ${s.ip || '未知'}</p>
             <p style="margin: 5px 0; font-size: 15px; color: #7f8c8d;">🔑 <b>登录:</b> ${s.loginMethod}</p>`;
-
         if (s.status.includes('Failed')) {
             htmlText += `<p style="margin: 5px 0; font-size: 15px; color: #e74c3c;">❌ <b>异常:</b> ${s.status}</p>`;
         } else {
-            htmlText += `<p style="margin: 5px 0; font-size: 15px;">⚡ <b>续期:</b> 
-                <span style="color: #27ae60; font-weight: bold;">${s.stats.success} 成功</span> / 
-                <span style="color: #f39c12;">${s.stats.skipped} 未到期</span> / 
+            htmlText += `<p style="margin: 5px 0; font-size: 15px;">⚡ <b>续期:</b>
+                <span style="color: #27ae60; font-weight: bold;">${s.stats.success} 成功</span> /
+                <span style="color: #f39c12;">${s.stats.skipped} 未到期</span> /
                 <span style="color: #c0392b;">${s.stats.failed} 失败</span>
             </p>
             <p style="margin: 5px 0; font-size: 15px;">📅 <b>最新到期:</b> <span style="color: #2980b9; font-weight: bold;">${formatDate(s.latestDate)}</span></p>`;
@@ -143,14 +198,10 @@ async function sendNotifications(summaryArr) {
     });
     htmlText += `</div></div>`;
 
-    if (process.env.TG_TOKEN && process.env.TG_CHAT) {
-        try { await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, { chat_id: process.env.TG_CHAT, text: mdText, parse_mode: 'Markdown' }); } catch (e) {}
-    }
-
     const smtp = getSmtpConfig();
     if (smtp && process.env.EMAIL_CHAT) {
         try {
-            const isSecure = (smtp.port === 465); 
+            const isSecure = (smtp.port === 465);
             const transporter = nodemailer.createTransport({
                 host: smtp.host, port: smtp.port, secure: isSecure, requireTLS: !isSecure,
                 auth: { user: smtp.user, pass: smtp.pass },
@@ -162,8 +213,16 @@ async function sendNotifications(summaryArr) {
                 subject: "☁️ HidenCloud 自动续期报告",
                 html: htmlText
             });
-        } catch (e) { console.error('❌ 邮件发送异常。'); }
+            console.log('✅ 邮件通知已发送');
+        } catch (e) {
+            console.error(`❌ 邮件通知失败: ${e.message}`);
+        }
+    } else {
+        console.log('⏭️ 未配置 SMTP_CONFIG / EMAIL_CHAT，跳过邮件通知');
     }
+
+    // ── WxPush ──
+    await sendWxPush(summaryArr);
 }
 
 (async () => {
@@ -176,14 +235,25 @@ async function sendNotifications(summaryArr) {
     const summary = [];
 
     for (const acc of accounts) {
-        const maskedUsername = maskEmail(acc.username); // workflow/控制台日志继续脱敏
+        const maskedUsername = maskEmail(acc.username);
         const accKey = `ACCOUNT_${acc.id}`;
+
+        // ── 随机延迟逻辑 (3到10分钟) ──
+        const minSeconds = 180; // 3分钟
+        const maxSeconds = 600; // 10分钟
+        const delaySeconds = Math.floor(Math.random() * (maxSeconds - minSeconds + 1)) + minSeconds;
+        const delayMinutes = Math.floor(delaySeconds / 60);
+        const delayRemainder = delaySeconds % 60;
+        
+        console.log(`\n⏳ 账号 ${maskedUsername} (ID: ${acc.id}) 将在随机延迟 ${delayMinutes}分${delayRemainder}秒 后开始运行...`);
+        await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+        // ────────────────────────────────
+
         console.log(`\n===========================================`);
         console.log(`▶ 开始处理账号: ${maskedUsername} (ID: ${acc.id})`);
-        
+
         let singBoxProcess = null, useProxy = false;
         let currentLoginMethod = '未知';
-        let exitIp = null; // 出口IP，明文只进 summary/通知，日志里脱敏打印
 
         if (acc.proxyUrl) {
             console.log(`🌐 解析代理 PROXY_URL_${acc.id}...`);
@@ -199,8 +269,8 @@ async function sendNotifications(summaryArr) {
             } catch (e) {
                 if (acc.proxyLock) {
                     console.log(`🚫 PROXY_LOCK 开启，放弃执行当前账号！`);
-                    summary.push({ user: acc.username, loginMethod: '未登录', status: 'Failed (代理失效)', stats: {}, latestDate: null, ip: null });
-                    continue; 
+                    summary.push({ user: maskedUsername, loginMethod: '未登录', status: 'Failed (代理失效)', stats: {}, latestDate: null });
+                    continue;
                 }
             }
         }
@@ -213,14 +283,13 @@ async function sendNotifications(summaryArr) {
         let browser, chromeProcess, page;
 
         try {
-            try { execSync(`pkill -9 -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
-            await waitPortFree(DEBUG_PORT);
+            try { execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
             chromeProcess = spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' });
             chromeProcess.unref();
 
             let ready = false;
             for (let k = 0; k < 20; k++) {
-                try { await axios.get(`http://localhost:${DEBUG_PORT}/json/version`, { timeout: 1000 }); ready = true; break; } 
+                try { await axios.get(`http://localhost:${DEBUG_PORT}/json/version`, { timeout: 1000 }); ready = true; break; }
                 catch(e) { await new Promise(r => setTimeout(r, 1000)); }
             }
             if (!ready) throw new Error('Chrome 启动超时');
@@ -228,12 +297,15 @@ async function sendNotifications(summaryArr) {
             browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
             page = await browser.contexts()[0].newPage();
             page.setDefaultTimeout(60000);
+            // 全局注入 Turnstile 探测脚本：Cookie 免密登录路径不经过 performLogin，
+            // 而续费弹窗里的新版 Turnstile 验证依赖该脚本定位复选框
+            await page.addInitScript(INJECTED_SCRIPT);
 
             console.log('🔍 验证连通性...');
             try {
                 await page.goto('https://api.ipify.org', { timeout: 20000 });
-                exitIp = (await page.innerText('body')).trim();
-                console.log(`✅ 网络就绪，出口 IP: ${maskIP(exitIp)}`); // 日志继续脱敏
+                const ip = await page.innerText('body');
+                console.log(`✅ 网络就绪，出口 IP: ${maskIP(ip)}`);
             } catch (e) { throw new Error(`网络不可达或代理断流`); }
 
             let loginSuccess = false;
@@ -261,17 +333,16 @@ async function sendNotifications(summaryArr) {
             const res = await manager.execute();
 
             globalState[accKey] = res.newState;
-            summary.push({ user: acc.username, loginMethod: currentLoginMethod, status: 'Success', stats: res.stats, latestDate: res.latestDueDate, ip: exitIp });
+            summary.push({ user: maskedUsername, loginMethod: currentLoginMethod, status: 'Success', stats: res.stats, latestDate: res.latestDueDate });
 
         } catch (e) {
             console.error(`❌ 异常: ${e.message}`);
             if (page) await page.screenshot({ path: `error_acc_${acc.id}_FINAL.png`, fullPage: true }).catch(()=>{});
-            summary.push({ user: acc.username, loginMethod: currentLoginMethod, status: `Failed: ${e.message}`, stats: {}, latestDate: null, ip: exitIp });
+            summary.push({ user: maskedUsername, loginMethod: currentLoginMethod, status: `Failed: ${e.message}`, stats: {}, latestDate: null });
         } finally {
             console.log('🧹 清理环境...');
             try { if (browser) await browser.close(); } catch(e){}
-            try { execSync(`pkill -9 -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
-            await waitPortFree(DEBUG_PORT);
+            try { execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`); } catch(e){}
             if (singBoxProcess && singBoxProcess.pid) {
                 try { process.kill(-singBoxProcess.pid); } catch(e) { try { execSync('pkill -f "sing-box run" || true'); } catch(err){} }
             }

@@ -1,0 +1,222 @@
+name: Obfuscate and Deploy to test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  obfuscate-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Dependencies
+        run: |
+          pip install astunparse python-minifier
+          npm install -g javascript-obfuscator
+
+      - name: Obfuscate Python
+        run: |
+          MARKER='#~obf'
+          cat << 'PYEOF' > ast_obf.py
+          import ast, random, base64, sys, zlib, builtins
+
+          RESERVED = set(dir(builtins)) | {
+              'self','cls','args','kwargs','__init__','__new__','__main__',
+              '__name__','__file__','__doc__','__all__','__slots__',
+              '__enter__','__exit__','__iter__','__next__','__len__',
+              '__getitem__','__setitem__','__contains__',
+              '__repr__','__str__','__hash__','__bool__','__call__',
+          }
+
+          def _rn():
+              """Generate visually confusing name using O/0/l/I/1."""
+              n = random.randint(16, 24)
+              chars = 'OolIi10'
+              return '_' + ''.join(random.choices(chars, k=n))
+
+          class Renamer(ast.NodeTransformer):
+              def __init__(self):
+                  self.scopes = [{}]
+                  self.preserve = set()
+
+              def _cur(self): return self.scopes[-1]
+              def _lookup(self, n):
+                  for s in reversed(self.scopes):
+                      if n in s: return s[n]
+                  return None
+              def _define(self, n):
+                  if n in RESERVED or n.startswith('__'): return n
+                  ex = self._lookup(n)
+                  if ex: return ex
+                  m = _rn()
+                  self._cur()[n] = m
+                  return m
+
+              def visit_Module(self, node):
+                  for s in ast.walk(node):
+                      if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                          self.preserve.add(s.name)
+                  self.generic_visit(node)
+                  return node
+
+              def _func(self, node):
+                  self.scopes.append({})
+                  for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
+                      if arg.arg not in ('self', 'cls'):
+                          arg.arg = self._define(arg.arg)
+                  if node.args.vararg: node.args.vararg.arg = self._define(node.args.vararg.arg)
+                  if node.args.kwarg:  node.args.kwarg.arg  = self._define(node.args.kwarg.arg)
+                  self.generic_visit(node)
+                  self.scopes.pop()
+                  return node
+
+              def visit_FunctionDef(self, node): return self._func(node)
+              def visit_AsyncFunctionDef(self, node): return self._func(node)
+
+              def visit_ClassDef(self, node):
+                  self.scopes.append({})
+                  self.generic_visit(node)
+                  self.scopes.pop()
+                  return node
+
+              def visit_Name(self, node):
+                  if node.id in RESERVED or node.id.startswith('__') or node.id in self.preserve:
+                      return node
+                  if isinstance(node.ctx, ast.Store):
+                      node.id = self._define(node.id)
+                  elif isinstance(node.ctx, ast.Load):
+                      m = self._lookup(node.id)
+                      if m: node.id = m
+                  return node
+
+          class StringEnc(ast.NodeTransformer):
+              """Replace string literals with zlib+b64 decode calls."""
+              def _wrap(self, s):
+                  try:
+                      enc = base64.b64encode(zlib.compress(s.encode('utf-8'), 9)).decode()
+                      expr = f"__import__('zlib').decompress(__import__('base64').b64decode('{enc}')).decode('utf-8')"
+                      return ast.parse(expr, mode='eval').body
+                  except Exception:
+                      return None
+
+              def visit_Constant(self, node):
+                  if isinstance(node.value, str) and len(node.value) >= 2:
+                      w = self._wrap(node.value)
+                      if w: return w
+                  return node
+
+          def obfuscate_file(path):
+              with open(path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+
+              shebang = ""
+              if content.startswith('#!'):
+                  lines = content.split('\n', 1)
+                  shebang = lines[0] + '\n'
+                  content = lines[1] if len(lines) > 1 else ""
+
+              try:
+                  tree = ast.parse(content)
+                  tree = Renamer().visit(tree)
+                  tree = StringEnc().visit(tree)
+                  ast.fix_missing_locations(tree)
+                  import astunparse
+                  stage1 = astunparse.unparse(tree)
+              except Exception:
+                  stage1 = content  # fallback to original if AST fails
+
+              try:
+                  # Wrap entire source in zlib+b64 exec() — pure Python, no marshal
+                  compressed = zlib.compress(stage1.encode('utf-8'), 9)
+                  payload = base64.b64encode(compressed).decode()
+                  wrapper = (
+                      "import zlib as _z,base64 as _b\n"
+                      f"exec(compile(_z.decompress(_b.b64decode('{payload}')).decode('utf-8'),'<c>','exec'))\n"
+                  )
+                  return shebang + wrapper
+              except Exception:
+                  import python_minifier
+                  return shebang + python_minifier.minify(content, remove_literal_statements=True)
+
+          if __name__ == "__main__":
+              result = obfuscate_file(sys.argv[1])
+              with open(sys.argv[1], 'w', encoding='utf-8') as f:
+                  f.write(result)
+          PYEOF
+
+          find . -type f -name '*.py' -not -name 'ast_obf.py' | while read f; do
+            if head -n 3 "$f" | grep -qF "$MARKER"; then continue; fi
+            python3 ast_obf.py "$f"
+            content=$(cat "$f")
+            if echo "$content" | head -n 1 | grep -q "^#!/"; then
+                echo "$content" | awk -v marker="$MARKER" 'NR==1; NR==2 {print marker} NR>1' > "$f.tmp"
+            else
+                { echo "$MARKER"; echo "$content"; } > "$f.tmp"
+            fi
+            mv "$f.tmp" "$f"
+          done
+          rm -f ast_obf.py
+
+      - name: Obfuscate JavaScript
+        run: |
+          MARKER='//~obf'
+          find . -type f -name '*.js' | while read f; do
+            if head -n 2 "$f" | grep -qF "$MARKER"; then continue; fi
+            tmpdir=$(mktemp -d)
+            javascript-obfuscator "$f" \
+              --output "$tmpdir" \
+              --compact true \
+              --self-defending true \
+              --control-flow-flattening true \
+              --control-flow-flattening-threshold 0.75 \
+              --dead-code-injection true \
+              --dead-code-injection-threshold 0.4 \
+              --identifier-names-generator hexadecimal \
+              --rename-globals false \
+              --rename-properties false \
+              --string-array true \
+              --string-array-calls-transform true \
+              --string-array-calls-transform-threshold 0.75 \
+              --string-array-encoding 'rc4' \
+              --string-array-rotate true \
+              --string-array-shuffle true \
+              --string-array-threshold 0.85 \
+              --split-strings true \
+              --split-strings-chunk-length 5 \
+              --numbers-to-expressions true \
+              --transform-object-keys true \
+              --unicode-escape-sequence true \
+              --debug-protection true \
+              --debug-protection-interval 4000
+            obf="$tmpdir/$(basename "$f")"
+            [ ! -f "$obf" ] && continue
+            if head -n 1 "$f" | grep -q "^#!/"; then
+              shebang=$(head -n 1 "$f")
+              { echo "$shebang"; echo "$MARKER"; cat "$obf"; } > "$f"
+            else
+              { echo "$MARKER"; cat "$obf"; } > "$f"
+            fi
+            rm -rf "$tmpdir"
+          done
+
+      - name: Clean Exclude Files
+        run: |
+          rm -rf .github/workflows
+          rm -f time.txt state.json
+
+      - name: Push to test Branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Deploy obfuscated code [skip ci]" || echo "Nothing to commit"
+          git push origin HEAD:refs/heads/test --force
