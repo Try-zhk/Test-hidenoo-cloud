@@ -17,7 +17,10 @@ try:
 
     USING_PATCHRIGHT = True
 except ImportError:
-    from playwright.sync_api import sync_playwright
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        sync_playwright = None
 
     USING_PATCHRIGHT = False
 
@@ -665,7 +668,7 @@ def send_telegram_notification(summary):
             "\n".join(
                 [
                     f"👤 <b>账号:</b> {html_mod.escape(str(item.get('full_user') or item['user']), quote=False)}",
-                    f"🌐 <b>出口IP:</b> {html_mod.escape(str(item['ip']), quote=False)}",
+                    f"🌐 <b>出口IP:</b> <code>{html_mod.escape(str(item['ip']), quote=False)}</code>",
                     f"🔑 <b>登录:</b> {html_mod.escape(str(item['login_method']), quote=False)}",
                     f"⚡ <b>续期:</b> {ok} 成功 / {skip} 未到期 / {fail} 失败",
                     f"📅 <b>到期:</b> {html_mod.escape(str(due), quote=False)}",
@@ -824,6 +827,35 @@ def send_wxpush_notification(summary):
     except Exception as e:
         log(f"❌ WxPush 通知失败: {e}")
         return False
+
+
+def build_full_summary(accounts, state, results):
+    by_id = {r["id"]: r for r in results}
+    full = []
+    for acc in accounts:
+        if acc["id"] in by_id:
+            full.append(by_id[acc["id"]])
+            continue
+        st = state.get(f"ACCOUNT_{acc['id']}") or {}
+        due = st.get("due_date") or "未知"
+        backoff = (
+            st.get("last_result") == "failed"
+            and (st.get("retry_at") or 0) > time.time()
+        )
+        full.append(
+            {
+                "id": acc["id"],
+                "user": mask_email(acc["username"]),
+                "full_user": acc["username"],
+                "login_method": st.get("login_method") or "未知",
+                "status": "❌ 上次续期失败，退避中" if backoff else "⏭️ 未到期，已跳过",
+                "old_due": due,
+                "new_due": due,
+                "ip": "未检测",
+                "failed": backoff,
+            }
+        )
+    return full
 
 
 def send_notifications(summary):
@@ -1575,7 +1607,8 @@ def main():
 
     pending_ids = accounts_to_renew(accounts, state)
     if not pending_ids:
-        log("⏭️ 所有账号均未到期，本次无需运行（不启动浏览器、不执行续期）。")
+        log("⏭️ 所有账号均未到期，本次不启动浏览器，仅发送汇总通知。")
+        send_notifications(build_full_summary(accounts, state, []))
         sys.exit(0)
     pending = [a for a in accounts if a["id"] in pending_ids]
     log(f"🎯 本次需要续期的账号: {', '.join(a['id'] for a in pending)}")
@@ -1603,6 +1636,10 @@ def main():
                         "failed": True,
                     }
                 summary.append(result)
+                if result.get("login_method") not in ("未登录", "未知"):
+                    state.setdefault(f"ACCOUNT_{acc['id']}", {})["login_method"] = result[
+                        "login_method"
+                    ]
                 if result.get("failed"):
                     exit_code = 1
         finally:
@@ -1610,7 +1647,7 @@ def main():
 
     save_state(state)
 
-    send_notifications(summary)
+    send_notifications(build_full_summary(accounts, state, summary))
 
     log("═══════════ 运行汇总 ═══════════")
     for item in summary:
