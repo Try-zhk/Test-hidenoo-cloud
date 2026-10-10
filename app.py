@@ -651,29 +651,34 @@ def send_telegram_notification(summary):
         log("⚠️ Telegram 未配置，跳过通知")
         return False
 
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-
+    sep = "━━━━━━━━━━━━━━━━━━"
     blocks = []
     for item in summary:
-        lines = [
-            f"👤 <b>账号:</b> <code>{escape_html(item['user'])}</code>",
-            f"🔑 <b>登录:</b> {escape_html(item['login_method'])}",
-        ]
         if item["failed"]:
-            lines.append(f"❌ <b>异常:</b> {escape_html(item['status'])}")
+            ok, skip, fail = 0, 0, 1
+        elif str(item["status"]).startswith("✅"):
+            ok, skip, fail = 1, 0, 0
         else:
-            lines.append(f"{escape_html(item['status'])}")
-            lines.append(f"📅 <b>续期前:</b> {escape_html(item['old_due'])}")
-            lines.append(f"📅 <b>续期后:</b> {escape_html(item['new_due'])}")
-            lines.append(f"🌐 <b>IP:</b> {escape_html(mask_ip(item['ip']))}")
-        blocks.append("\n".join(lines))
+            ok, skip, fail = 0, 1, 0
+        due = item["new_due"] if ok else item["old_due"]
+        blocks.append(
+            "\n".join(
+                [
+                    f"👤 <b>账号:</b> {html_mod.escape(str(item.get('full_user') or item['user']), quote=False)}",
+                    f"🌐 <b>出口IP:</b> {html_mod.escape(str(item['ip']), quote=False)}",
+                    f"🔑 <b>登录:</b> {html_mod.escape(str(item['login_method']), quote=False)}",
+                    f"⚡ <b>续期:</b> {ok} 成功 / {skip} 未到期 / {fail} 失败",
+                    f"📅 <b>到期:</b> {html_mod.escape(str(due), quote=False)}",
+                ]
+            )
+        )
 
     text = (
         "☁️ <b>HidenCloud 自动续期报告</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        + "\n━━━━━━━━━━━━━━━━━━\n".join(blocks)
-        + f"\n━━━━━━━━━━━━━━━━━━\n🕒 {now}"
+        + sep
+        + "\n"
+        + f"\n{sep}\n".join(blocks)
+        + f"\n{sep}"
     )
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -1417,6 +1422,7 @@ def run_single_account(p, acc, state):
     result = {
         "id": acc["id"],
         "user": masked,
+        "full_user": EMAIL,
         "login_method": "未登录",
         "status": "❌ 未执行",
         "old_due": "未知",
@@ -1588,6 +1594,7 @@ def main():
                     result = {
                         "id": acc["id"],
                         "user": mask_email(acc.get("username", "")),
+                        "full_user": acc.get("username", ""),
                         "login_method": "未知",
                         "status": f"❌ 异常: {e}",
                         "old_due": "未知",
