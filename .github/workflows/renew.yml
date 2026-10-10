@@ -1,112 +1,233 @@
-name: Hiden-cloud Auto Renew
+name: Auto Renew HidenCloud
 
 on:
-  schedule:
-    - cron: '32 23 * * *'
-    - cron: '11 11 * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '0 1 * * *'
+    - cron: '0 13 * * *'
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
-  renew:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-      actions: write
+  renew-hiden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
-          node-version: '20'
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
-      - name: 🏃 Inline Pre-check (Timestamp < 24h)
+      - name: 🔎 检查是否有账号需要续期
         id: precheck
         env:
-          SECRETS_CONTEXT: ${{ toJson(secrets) }}
-        run: |
-          node -e "
-            const fs = require('fs');
-            const now = Date.now();
-            let shouldRun = false;
-            let state = {};
-            
-            if (!fs.existsSync('./state.json')) {
-                console.log('state.json 不存在，初次运行。');
-                shouldRun = true;
-            } else {
-                try { state = JSON.parse(fs.readFileSync('./state.json', 'utf8')); } catch(e) { shouldRun = true; }
-            }
-            
-            if (!shouldRun) {
-                const secrets = JSON.parse(process.env.SECRETS_CONTEXT || '{}');
-                for (const key in secrets) {
-                    if (key.startsWith('HIDEN_ACCOUNT_')) {
-                        const id = key.replace('HIDEN_ACCOUNT_', '');
-                        const accKey = 'ACCOUNT_' + id; // 隐私匹配 ACCOUNT_1
-                        if (!state[accKey] || Object.keys(state[accKey]).length === 0) {
-                            shouldRun = true; break;
-                        }
-                        for (const svcHash in state[accKey]) {
-                            if (state[accKey][svcHash] - now <= 86400000) { // 距今不足 24 小时
-                                shouldRun = true; break;
-                            }
-                        }
-                    }
-                    if (shouldRun) break;
-                }
-            }
-            if (!shouldRun) console.log('✅ 所有账号距离到期均大于 24h，跳过执行。');
-            fs.appendFileSync(process.env.GITHUB_ENV, \`SHOULD_RUN=\${shouldRun}\n\`);
-          "
-
-      - name: Install Dependencies
-        if: env.SHOULD_RUN == 'true'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y xvfb
-          npm install
-          npx playwright install-deps chrome
-          
-          wget -qO sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.13.7/sing-box-1.13.7-linux-amd64.tar.gz
-          tar -xzf sing-box.tar.gz
-          mv sing-box-*/sing-box ./
-          chmod +x ./sing-box
-
-      - name: ⚙️ Load Environment Variables
-        if: env.SHOULD_RUN == 'true'
-        env:
+          SECRETS_JSON: ${{ toJson(secrets) }}
           VARS_JSON: ${{ toJson(vars) }}
         run: |
-          node -e "
-            const v = JSON.parse(process.env.VARS_JSON || '{}');
-            const fs = require('fs');
-            for (const k in v) {
-              const val = v[k] || '';
-              fs.appendFileSync(process.env.GITHUB_ENV, \`\${k}<<EOF\n\${val}\nEOF\n\`);
-            }
-          "
-          echo "GITHUB_REPO=${{ github.repository }}" >> $GITHUB_ENV
+          python3 - <<'PY'
+          import json
+          import os
+          import time
 
-      - name: Run Main Action Script
+          variables = json.loads(os.environ.get('VARS_JSON') or '{}')
+          due_within_hours = float(variables.get('DUE_WITHIN_HOURS') or 24)
+
+          accounts = {}
+          for key, value in (json.loads(os.environ.get('SECRETS_JSON') or '{}')).items():
+              if key.startswith('HIDEN_ACCOUNT_') and (value or '').strip():
+                  parts = (value or '').split()
+                  if len(parts) >= 2:
+                      accounts[key.replace('HIDEN_ACCOUNT_', '')] = True
+
+          state = {}
+          if os.path.exists('state.json'):
+              try:
+                  state = json.load(open('state.json', encoding='utf-8'))
+              except Exception:
+                  state = {}
+
+          now = int(time.time())
+          pending = []
+          for acc_id in sorted(accounts, key=int):
+              acc_state = state.get(f'ACCOUNT_{acc_id}') or {}
+              due_ts = acc_state.get('due_ts') or 0
+
+              retry_at = acc_state.get('retry_at') or 0
+              if acc_state.get('last_result') == 'failed' and retry_at and now < retry_at:
+                  print(f'⏳ 账号 {acc_id}: 上次续期失败，退避中（{int((retry_at - now) / 60)} 分钟后重试），跳过')
+                  continue
+
+              if not due_ts:
+                  print(f'🆕 账号 {acc_id}: state.json 无到期记录，需要运行')
+                  pending.append(acc_id)
+                  continue
+              remaining = due_ts - now
+              if remaining <= due_within_hours * 3600:
+                  print(f'⏰ 账号 {acc_id}: 剩余 {remaining/3600:.1f} 小时（到期日 {acc_state.get("due_date")}），需要运行')
+                  pending.append(acc_id)
+              else:
+                  print(f'✅ 账号 {acc_id}: 剩余 {remaining/3600:.1f} 小时（到期日 {acc_state.get("due_date")}），跳过')
+
+          should_run = 'true' if pending else 'false'
+          if not pending:
+              print('⏭️ 所有账号均未到期，跳过后续所有步骤。')
+          else:
+              print(f'🎯 本次需要续期的账号: {", ".join(pending)}')
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
+              fh.write(f'SHOULD_RUN={should_run}\n')
+              fh.write(f'RENEW_ACCOUNTS={",".join(pending)}\n')
+              fh.write(f'DUE_WITHIN_HOURS={due_within_hours:g}\n')
+          PY
+
+      - name: ⚙ 设置 Python
         if: env.SHOULD_RUN == 'true'
-        env: ${{ secrets }} 
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" npm start
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
 
-      - name: 📸 Upload Debug Screenshots
+      - name: 🛠️ 安装系统依赖和python依赖
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install patchright requests 'requests[socks]'
+          python -m patchright install --with-deps chrome
+
+      - name: 📦 安装 sing-box（供各账号独立代理使用）
+        if: env.SHOULD_RUN == 'true'
+        continue-on-error: true
+        run: |
+          VER=1.13.16
+          wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz" \
+            && tar -xzf sing-box.tar.gz \
+            && mv "sing-box-${VER}-linux-amd64/sing-box" ./ \
+            && chmod +x ./sing-box \
+            && echo "SINGBOX_BIN=$PWD/sing-box" >> $GITHUB_ENV \
+            && echo "✅ sing-box 就绪" \
+            || echo "⚠️ sing-box 下载失败，本次将无法运行"
+
+      - name: ⚙ 设置全局代理（可选 NODE_LINK）
+        if: env.SHOULD_RUN == 'true'
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+      - name: 🔑 注入环境变量
+        if: env.SHOULD_RUN == 'true'
+        env:
+          SECRETS_JSON: ${{ toJson(secrets) }}
+          VARS_JSON: ${{ toJson(vars) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          secrets = json.loads(os.environ.get('SECRETS_JSON') or '{}')
+          variables = json.loads(os.environ.get('VARS_JSON') or '{}')
+
+          account_pattern = re.compile(r'^(HIDEN_ACCOUNT|PROXY_URL|PROXY_LOCK)_\d+$')
+          fixed_names = {
+              'EMAIL', 'PASSWORD', 'PROXY_URL', 'PROXY_LOCK', 'NODE_LINK',
+              'TG_TOKEN', 'TG_CHAT', 'SMTP_CONFIG', 'EMAIL_CHAT',
+              'WXPUSH_API', 'WXPUSH_TOKEN',
+              'TG_BOT_TOKEN', 'TG_CHAT_ID',
+              'DUE_WITHIN_HOURS', 'RETRY_AFTER_HOURS',
+          }
+
+          names = sorted(n for n in (set(secrets) | set(variables))
+                         if n in fixed_names or account_pattern.match(n))
+
+          out = []
+          for name in names:
+              value = secrets.get(name)
+              if value in (None, ''):
+                  value = variables.get(name)
+              if value in (None, ''):
+                  continue
+              out.append(f'{name}<<__EOF__\n{value}\n__EOF__')
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
+              fh.write('\n'.join(out) + '\n')
+
+          print('已注入变量: ' + ', '.join(names))
+          if not any(n.startswith('HIDEN_ACCOUNT_') for n in names):
+              print('::error::未找到任何 HIDEN_ACCOUNT_n，请检查仓库 Secrets 是否配置了 HIDEN_ACCOUNT_1')
+          PY
+
+      - name: ✅ 校验变量已生效
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            name="HIDEN_ACCOUNT_$i"
+            value="$(printenv "$name" || true)"
+            if [ -n "$value" ]; then
+              echo "✅ $name 已生效（长度 ${#value}）"
+            fi
+          done
+          if [ -z "$(printenv HIDEN_ACCOUNT_1 || true)" ]; then
+            echo "::error::HIDEN_ACCOUNT_1 未注入成功。请确认在 Settings → Secrets and variables → Actions 的 Secrets 中已添加 HIDEN_ACCOUNT_1（格式：邮箱 密码）"
+            exit 1
+          fi
+
+      - name: 🚀 运行续期脚本
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+
+      - name: 📸 上传调试截图
         if: always() && env.SHOULD_RUN == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: ./*.png
+          path: art/**/*.png
+          if-no-files-found: ignore
           retention-days: 3
 
-      - name: Auto Commit state.json
-        if: env.SHOULD_RUN == 'true' && always()
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: update state.json timestamps"
-          file_pattern: 'state.json'
+      - name: 💾 提交 state.json
+        if: always() && env.SHOULD_RUN == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state change"
+          else
+            git commit -m "💾 Update state.json $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push || true
+          fi
+
+      - name: 🕒 更新时间
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin main
+          fi
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
