@@ -30,5 +30,13 @@
     "due_ts": 1792281600,
     "updated_at": "2026-10-10 06:12:51",
     "login_method": "密码验证 + CF盾"
+  },
+  "ACCOUNT_7": {
+    "service_id": "233352",
+    "due_date": "14 Oct 2026",
+    "due_ts": 1791936000,
+    "updated_at": "2026-10-10 06:21:17",
+    "last_result": "success",
+    "login_method": "密码验证 + CF盾"
   }
 }
