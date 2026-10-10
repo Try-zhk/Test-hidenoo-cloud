@@ -8,7 +8,8 @@ import shutil
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, unquote, urlparse
+import zlib
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
@@ -234,6 +235,872 @@ def accounts_to_renew(accounts, state):
     return pending
 
 
+# ======== 代理链接 → sing-box outbound（来自 linktosb.py）========
+
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
+
+def b64decode(value):
+    value = value.strip().replace("-", "+").replace("_", "/")
+    value += "=" * (-len(value) % 4)
+    return base64.b64decode(value).decode("utf-8", errors="replace")
+
+
+def query_value(query, key, default=""):
+    return query.get(key, [default])[0] or default
+
+
+def bool_value(value):
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def split_host_port(value):
+    """host:port / [ipv6]:port"""
+    value = (value or "").strip().rstrip("/")
+    if not value:
+        raise ValueError("空的 host:port")
+
+    if value.startswith("["):
+        if "]:" not in value:
+            raise ValueError("IPv6 地址缺少端口: " + value)
+        host, port = value.rsplit("]:", 1)
+        return host[1:], int(port)
+
+    # 仅最后一个 : 作为端口分隔（兼容域名/IPv4；无括号 IPv6 需带 []）
+    if value.count(":") == 1 or (value.count(":") > 1 and value.rsplit(":", 1)[-1].isdigit()):
+        host, port = value.rsplit(":", 1)
+        if host.count(":") >= 2 and not host.startswith("["):
+            # 裸 IPv6 无端口
+            raise ValueError("IPv6 请使用 [addr]:port 形式: " + value)
+        return host, int(port)
+
+    raise ValueError("无法解析 host:port: " + value)
+
+
+def tag_from_url(parts, default):
+    name = unquote(parts.fragment).strip()
+    return name or default
+
+
+def ensure_tag(outbound, default="proxy"):
+    if not isinstance(outbound, dict):
+        raise ValueError("outbound 必须是对象")
+    tag = outbound.get("tag")
+    if not tag:
+        outbound["tag"] = default
+    return outbound
+
+
+def normalize_link(link):
+    link = (link or "").strip()
+    if not link:
+        raise ValueError("链接为空")
+    return link
+
+
+def scheme_of(link):
+    return urlsplit(link).scheme.lower()
+
+
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+
+def _build_tls_base(query, server, default_insecure=False):
+    """构建基础 TLS 属性（insecure / server_name / utls / alpn）。"""
+    insecure_param = query_value(query, "allowInsecure") or query_value(query, "insecure")
+    if insecure_param == "":
+        insecure = default_insecure
+    else:
+        insecure = bool_value(insecure_param)
+
+    tls = {
+        "enabled": True,
+        "server_name": query_value(query, "sni") or server,
+        "insecure": insecure,
+    }
+
+    fingerprint = query_value(query, "fp")
+    if fingerprint:
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+
+    alpn = query_value(query, "alpn")
+    if alpn:
+        tls["alpn"] = [item.strip() for item in alpn.split(",") if item.strip()]
+
+    return tls
+
+
+def make_tls(query, server, default_insecure=False):
+    """
+    security=tls|reality 时生成 tls 块。
+    insecure：显式参数为准；未写时默认 False（比旧版 True 更安全）。
+    SNI：sni > server（不用 host 兜底，host 多为 WS Host）。
+    """
+    security = query_value(query, "security").lower()
+    if security not in ("tls", "reality"):
+        return None
+
+    tls = _build_tls_base(query, server, default_insecure=default_insecure)
+
+    if security == "reality":
+        public_key = query_value(query, "pbk")
+        short_id = query_value(query, "sid")
+        if not public_key:
+            raise ValueError("Reality 节点缺少 pbk 参数")
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": public_key,
+            "short_id": short_id or "",
+        }
+
+    return tls
+
+
+def force_tls(query, server, default_insecure=False):
+    """trojan / anytls / hy2 等默认强制 TLS。"""
+    tls = make_tls(query, server, default_insecure=default_insecure)
+    if tls:
+        return tls
+    return _build_tls_base(query, server, default_insecure=default_insecure)
+
+# ---------------------------------------------------------------------------
+# Worker path：ed / proxyip / p / s / wk
+# ---------------------------------------------------------------------------
+
+def split_early_data(path, query=None):
+    """
+    只剥离 ed，保留 proxyip 等其余 query。
+    顶层 query 的 ed 优先于 path 内 ed。
+    """
+    max_early_data = None
+
+    if query is not None:
+        ed_param = query_value(query, "ed")
+        if ed_param:
+            try:
+                max_early_data = int(ed_param)
+            except ValueError:
+                max_early_data = None
+
+    path = path or "/"
+    if "?" not in path:
+        return path, max_early_data
+
+    base, _, qs = path.partition("?")
+
+    m = re.search(r"(?:^|&)ed=(\d+)(?=&|$)", qs)
+    if m and max_early_data is None:
+        try:
+            max_early_data = int(m.group(1))
+        except ValueError:
+            pass
+
+    new_qs = re.sub(r"(?:^|&)ed=\d+(?=&|$)", "", qs)
+    new_qs = re.sub(r"^&+|&+$", "", new_qs)
+    new_qs = re.sub(r"&{2,}", "&", new_qs)
+
+    if new_qs:
+        clean = f"{base or '/'}?{new_qs}"
+    else:
+        clean = base or "/"
+
+    return clean, max_early_data
+
+
+def strip_inline_note(value):
+    """去掉 path 内 /#备注 或尾部 #备注。"""
+    value = (value or "").strip()
+    if "/#" in value:
+        value = value.split("/#", 1)[0]
+    # socks URL 中 # 极少作密码；落地备注常见 /#name
+    if value.endswith("#"):
+        value = value[:-1]
+    return value.rstrip("/")
+
+
+def parse_path_params(path):
+    """
+    解析 Worker 风格 path，不用 parse_qs，避免破坏 :// @。
+    支持：
+      /?ed=2560&proxyip=socks5://u:p@h:port/
+      /proxyip=1.2.3.4:81
+      /p=1.1.1.1
+      /?s=user:pass@host:1080&wk=us
+    """
+    path = unquote(path or "/")
+    params = {}
+
+    m = re.match(r"^/(proxyip|p|s|wk)=(.+)$", path, re.I)
+    if m:
+        params[m.group(1).lower()] = m.group(2).strip()
+        return params
+
+    if "?" not in path:
+        return params
+
+    _, _, qs = path.partition("?")
+    for part in qs.split("&"):
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip().lower()
+        if k:
+            params[k] = v.strip()
+    return params
+
+
+def parse_proxy_url_to_outbound(proxy_url, tag, default_socks_version="5"):
+    """socks:// socks5:// http:// https:// 或 user:pass@host:port → outbound。"""
+    raw = strip_inline_note(proxy_url)
+    if not raw:
+        raise ValueError("空的 proxyip")
+
+    lower = raw.lower()
+    version = default_socks_version
+
+    if lower.startswith("socks5h://"):
+        scheme, rest = "socks", raw[len("socks5h://") :]
+        version = "5"
+    elif lower.startswith("socks5://"):
+        scheme, rest = "socks", raw[len("socks5://") :]
+        version = "5"
+    elif lower.startswith("socks4://"):
+        scheme, rest = "socks", raw[len("socks4://") :]
+        version = "4"
+    elif lower.startswith("socks://"):
+        scheme, rest = "socks", raw[len("socks://") :]
+        version = default_socks_version
+    elif lower.startswith("https://"):
+        scheme, rest = "http", raw[len("https://") :]
+    elif lower.startswith("http://"):
+        scheme, rest = "http", raw[len("http://") :]
+    elif "://" in raw:
+        raise ValueError("不支持的 proxy 协议: " + raw.split("://", 1)[0])
+    else:
+        scheme, rest = "socks", raw
+        version = default_socks_version
+
+
+    rest = strip_inline_note(rest)
+    username = password = ""
+
+    if "@" in rest:
+        userinfo, hostport = rest.rsplit("@", 1)
+        if ":" in userinfo:
+            username, password = userinfo.split(":", 1)
+        else:
+            username = userinfo
+    else:
+        hostport = rest
+
+    hostport = strip_inline_note(hostport)
+    if "#" in hostport:
+        hostport = hostport.split("#", 1)[0]
+
+    host, port = split_host_port(hostport)
+
+    if scheme == "socks":
+        outbound = {
+            "type": "socks",
+            "tag": tag,
+            "server": host,
+            "server_port": port,
+            "version": str(version),
+        }
+        if username:
+            outbound["username"] = unquote(username)
+        if password:
+            outbound["password"] = unquote(password)
+        return outbound
+
+    outbound = {
+        "type": "http",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+    }
+    if username:
+        outbound["username"] = unquote(username)
+    if password:
+        outbound["password"] = unquote(password)
+    if lower.startswith("https://"):
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": host,
+            "insecure": False,
+        }
+    return outbound
+
+
+def is_direct_proxy_url(value):
+    if not value:
+        return False
+    low = value.lower()
+    if low.startswith(("socks://", "socks5://", "socks5h://", "socks4://", "http://", "https://")):
+        return True
+    return False
+
+
+def rewrite_worker_path(path, query=None):
+    """
+    返回 (clean_path, max_early_data, direct_proxy_url_or_None)
+
+    - socks/http 类 proxyip 或 s= → direct_proxy_url，由调用方生成直连 outbound
+    - 裸 IP/域名 → 无问号 path /proxyip=...，减轻 sing-box 对 ? 的编码问题
+    - 无落地 → 仅剥 ed
+    """
+    path = unquote(path or "/")
+    clean, max_early_data = split_early_data(path, query)
+    params = parse_path_params(clean)
+
+    socks_short = params.get("s")
+    # p 与 proxyip：README 中 p 为 ProxyIP；proxyip 为完整写法
+    proxyip = params.get("proxyip") or params.get("p")
+    wk = params.get("wk")
+
+    candidate = None
+    if socks_short:
+        if "://" not in socks_short:
+            candidate = "socks5://" + strip_inline_note(socks_short)
+        else:
+            candidate = strip_inline_note(socks_short)
+    elif proxyip:
+        candidate = strip_inline_note(proxyip)
+
+    if candidate:
+        # 显式代理 URL 或 s= 用户信息 → 直连
+        if is_direct_proxy_url(candidate) or socks_short:
+            if not is_direct_proxy_url(candidate) and "@" in candidate:
+                candidate = "socks5://" + candidate
+            return "/", max_early_data, candidate
+
+        # 裸 IP / 域名 / host:port → 无 ? 的 Worker path（p 优先于 wk）
+        return "/proxyip=" + candidate, max_early_data, None
+
+    if wk:
+        # 仅地区码：无问号形式
+        others = {k: v for k, v in params.items() if k not in ("ed", "wk")}
+        if not others:
+            return "/wk=" + wk, max_early_data, None
+        # 仍有其它参数时尽量拼 query（少见）
+        rest = "&".join(f"{k}={v}" for k, v in params.items() if k != "ed")
+        return (("/?" + rest) if rest else "/"), max_early_data, None
+
+    return clean, max_early_data, None
+
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+
+def make_transport(network, query):
+    """
+    返回 (transport_or_None, direct_proxy_url_or_None)
+    direct_proxy 非空时：外层应直接生成 socks/http，不再使用 transport。
+    """
+    network = (network or "tcp").lower()
+
+    if network in ("", "tcp", "none"):
+        if query_value(query, "headerType").lower() == "http":
+            path = unquote(query_value(query, "path", "/")) or "/"
+            host = query_value(query, "host")
+            transport = {"type": "http", "path": path}
+            if host:
+                transport["host"] = [h.strip() for h in host.split(",") if h.strip()]
+            return transport, None
+        return None, None
+
+    path = unquote(query_value(query, "path", "/")) or "/"
+    host = query_value(query, "host")
+
+    if network == "ws":
+        clean_path, max_early_data, direct_proxy = rewrite_worker_path(path, query)
+        if direct_proxy:
+            return None, direct_proxy
+        transport = {
+            "type": "ws",
+            "path": clean_path or "/",
+        }
+        if host:
+            transport["headers"] = {"Host": host}
+        if max_early_data:
+            transport["max_early_data"] = max_early_data
+            transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        return transport, None
+
+    if network in ("grpc", "gun"):
+        service_name = (
+            query_value(query, "serviceName")
+            or query_value(query, "service_name")
+            or unquote(query_value(query, "path", "")).strip("/")
+        )
+        return {"type": "grpc", "service_name": service_name}, None
+
+    if network == "httpupgrade":
+        clean_path, max_early_data, direct_proxy = rewrite_worker_path(path, query)
+        if direct_proxy:
+            return None, direct_proxy
+        transport = {"type": "httpupgrade", "path": clean_path or "/"}
+        if host:
+            transport["host"] = host
+        return transport, None
+
+    if network in ("http", "h2"):
+        transport = {"type": "http", "path": path}
+        if host:
+            transport["host"] = [h.strip() for h in host.split(",") if h.strip()]
+        return transport, None
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# 各协议
+# ---------------------------------------------------------------------------
+
+def parse_vless(link):
+    parts = urlsplit(link)
+    query = parse_qs(parts.query)
+
+    if not parts.username or not parts.hostname or not parts.port:
+        raise ValueError("VLESS 链接缺少 UUID、服务器或端口")
+
+    tag = tag_from_url(parts, "vless")
+    transport, direct_proxy = make_transport(query_value(query, "type"), query)
+
+    if direct_proxy:
+        return parse_proxy_url_to_outbound(direct_proxy, tag)
+
+    outbound = {
+        "type": "vless",
+        "tag": tag,
+        "server": parts.hostname,
+        "server_port": int(parts.port),
+        "uuid": unquote(parts.username),
+        "packet_encoding": "xudp",
+    }
+
+    flow = query_value(query, "flow")
+    if flow:
+        outbound["flow"] = flow
+
+    encryption = query_value(query, "encryption")
+    if encryption and encryption != "none":
+        # sing-box vless 通常无 encryption 字段；忽略 none 以外的兼容提示
+        pass
+
+    tls = make_tls(query, parts.hostname, default_insecure=False)
+    if tls:
+        outbound["tls"] = tls
+
+    if transport:
+        outbound["transport"] = transport
+
+    return outbound
+
+
+def parse_trojan(link):
+    parts = urlsplit(link)
+    query = parse_qs(parts.query)
+
+    if not parts.username or not parts.hostname or not parts.port:
+        raise ValueError("Trojan 链接缺少密码、服务器或端口")
+
+    tag = tag_from_url(parts, "trojan")
+    transport, direct_proxy = make_transport(query_value(query, "type"), query)
+    if direct_proxy:
+        return parse_proxy_url_to_outbound(direct_proxy, tag)
+
+    outbound = {
+        "type": "trojan",
+        "tag": tag,
+        "server": parts.hostname,
+        "server_port": int(parts.port),
+        "password": unquote(parts.username),
+    }
+    outbound["tls"] = force_tls(query, parts.hostname, default_insecure=False)
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def parse_anytls(link):
+    parts = urlsplit(link)
+    query = parse_qs(parts.query)
+
+    if not parts.hostname or not parts.port:
+        raise ValueError("AnyTLS 链接缺少服务器或端口")
+
+    outbound = {
+        "type": "anytls",
+        "tag": tag_from_url(parts, "anytls"),
+        "server": parts.hostname,
+        "server_port": int(parts.port),
+        "password": unquote(parts.username or ""),
+    }
+    outbound["tls"] = force_tls(query, parts.hostname, default_insecure=False)
+    return outbound
+
+
+def parse_ss(link):
+    raw = link[len("ss://") :]
+    raw, _, fragment = raw.partition("#")
+    tag = unquote(fragment) or "shadowsocks"
+
+    plugin = plugin_opts = ""
+    if "?" in raw:
+        raw, _, q = raw.partition("?")
+        qmap = parse_qs(q)
+        plugin = query_value(qmap, "plugin")
+        # SIP002: plugin=name;opt=val
+        if plugin and ";" in plugin:
+            plugin, plugin_opts = plugin.split(";", 1)
+
+    if "@" not in raw:
+        try:
+            raw = b64decode(raw)
+        except Exception as exc:
+            raise ValueError("Shadowsocks 链接解码失败") from exc
+
+    if "@" not in raw:
+        raise ValueError("Shadowsocks 链接格式无效")
+
+    userinfo, address = raw.rsplit("@", 1)
+
+    try:
+        decoded = b64decode(userinfo)
+        if ":" in decoded:
+            userinfo = decoded
+    except Exception:
+        pass
+
+    userinfo = unquote(userinfo)
+    if ":" not in userinfo:
+        raise ValueError("Shadowsocks 链接缺少加密方式或密码")
+
+    method, password = userinfo.split(":", 1)
+    server, port = split_host_port(unquote(address))
+
+    outbound = {
+        "type": "shadowsocks",
+        "tag": tag,
+        "server": server,
+        "server_port": port,
+        "method": method,
+        "password": password,
+    }
+
+    # sing-box 插件名与 SIP002 不完全一致；有 plugin 时尽量映射常见项
+    if plugin:
+        name = plugin.lower()
+        if "obfs" in name:
+            # 简单兼容：无法可靠转成 sing-box 时保留注释字段不利于内核；跳过并警告
+            print("警告: SS plugin 未映射到 sing-box outbound，已忽略: " + plugin, file=sys.stderr)
+        elif "v2ray" in name:
+            print("警告: SS v2ray-plugin 未映射，已忽略: " + plugin, file=sys.stderr)
+        else:
+            print("警告: 未知 SS plugin，已忽略: " + plugin, file=sys.stderr)
+
+    return outbound
+
+
+def parse_vmess(link):
+    raw = link[len("vmess://") :]
+    # 部分链接带 fragment
+    raw = raw.split("#", 1)[0]
+    data = json.loads(b64decode(raw))
+
+    host = data.get("add")
+    uuid = data.get("id")
+    if not host or not uuid:
+        raise ValueError("VMess 链接缺少服务器或 UUID")
+
+    try:
+        port = int(data.get("port", 443))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VMess 端口无效") from exc
+
+    tag = data.get("ps") or "vmess"
+    path = data.get("path") or "/"
+    host_header = data.get("host") or ""
+    network = (data.get("net") or "tcp").lower()
+
+    # vmess path 也可能带 worker 落地
+    if network == "ws":
+        clean_path, max_early_data, direct_proxy = rewrite_worker_path(path, None)
+        if direct_proxy:
+            return parse_proxy_url_to_outbound(direct_proxy, tag)
+    else:
+        clean_path, max_early_data, direct_proxy = path, None, None
+
+    outbound = {
+        "type": "vmess",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "uuid": uuid,
+        "security": data.get("scy") or "auto",
+        "alter_id": int(data.get("aid") or 0),
+        "packet_encoding": "xudp",
+    }
+
+    tls_mode = str(data.get("tls") or "").lower()
+    if tls_mode in ("tls", "reality"):
+        insecure = bool_value(data.get("allowInsecure") or data.get("insecure") or "")
+        tls = {
+            "enabled": True,
+            "server_name": data.get("sni") or host,
+            "insecure": insecure,
+        }
+        if data.get("fp"):
+            tls["utls"] = {"enabled": True, "fingerprint": data["fp"]}
+        if tls_mode == "reality":
+            if not data.get("pbk"):
+                raise ValueError("VMess Reality 缺少 pbk")
+            tls["reality"] = {
+                "enabled": True,
+                "public_key": data.get("pbk", ""),
+                "short_id": data.get("sid", "") or "",
+            }
+        outbound["tls"] = tls
+
+    if network == "ws":
+        transport = {"type": "ws", "path": clean_path or "/"}
+        if host_header:
+            transport["headers"] = {"Host": host_header}
+        if max_early_data:
+            transport["max_early_data"] = max_early_data
+            transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        outbound["transport"] = transport
+    elif network in ("grpc", "gun"):
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": str(path).strip("/"),
+        }
+    elif network in ("http", "h2"):
+        transport = {"type": "http", "path": path or "/"}
+        if host_header:
+            transport["host"] = [h.strip() for h in host_header.split(",") if h.strip()]
+        outbound["transport"] = transport
+    elif network == "httpupgrade":
+        transport = {"type": "httpupgrade", "path": path or "/"}
+        if host_header:
+            transport["host"] = host_header
+        outbound["transport"] = transport
+
+    return outbound
+
+
+def parse_hysteria2(link):
+    parts = urlsplit(link)
+    query = parse_qs(parts.query)
+
+    if not parts.hostname or not parts.port:
+        raise ValueError("Hysteria2 链接缺少服务器或端口")
+
+    if parts.password:
+        password = unquote(parts.username or "") + ":" + unquote(parts.password)
+    else:
+        password = unquote(parts.username or "")
+
+    outbound = {
+        "type": "hysteria2",
+        "tag": tag_from_url(parts, "hysteria2"),
+        "server": parts.hostname,
+        "server_port": int(parts.port),
+        "password": password,
+        "tls": force_tls(query, parts.hostname, default_insecure=True),
+    }
+
+    # 带宽（可选）
+    for key_src, key_dst in (
+        ("up", "up_mbps"),
+        ("upmbps", "up_mbps"),
+        ("down", "down_mbps"),
+        ("downmbps", "down_mbps"),
+    ):
+        val = query_value(query, key_src)
+        if val:
+            try:
+                # 支持 "100" 或 "100Mbps"
+                num = int(re.sub(r"[^\d]", "", val) or "0")
+                if num > 0:
+                    outbound[key_dst] = num
+            except ValueError:
+                pass
+
+    # 端口跳跃 mport / ports
+    ports = query_value(query, "mport") or query_value(query, "ports")
+    if ports:
+        outbound["server_ports"] = [ports]
+
+    hop = query_value(query, "hop_interval") or query_value(query, "hopInterval")
+    if hop:
+        if hop.isdigit():
+            hop = hop + "s"
+        outbound["hop_interval"] = hop
+
+    obfs = query_value(query, "obfs")
+    obfs_password = query_value(query, "obfs-password") or query_value(query, "obfs_password")
+    if obfs == "salamander" and obfs_password:
+        outbound["obfs"] = {"type": "salamander", "password": obfs_password}
+
+    return outbound
+
+
+def parse_tuic(link):
+    parts = urlsplit(link)
+    query = parse_qs(parts.query)
+
+    if not parts.username or not parts.hostname or not parts.port:
+        raise ValueError("TUIC 链接缺少 UUID、服务器或端口")
+
+    insecure_param = query_value(query, "allowInsecure") or query_value(query, "insecure")
+    if insecure_param == "":
+        insecure = True  # tuic 分享链接常见自签
+    else:
+        insecure = bool_value(insecure_param)
+
+    outbound = {
+        "type": "tuic",
+        "tag": tag_from_url(parts, "tuic"),
+        "server": parts.hostname,
+        "server_port": int(parts.port),
+        "uuid": unquote(parts.username),
+        "password": unquote(parts.password or ""),
+        "congestion_control": query_value(query, "congestion_control", "bbr"),
+        "tls": {
+            "enabled": True,
+            "server_name": query_value(query, "sni") or parts.hostname,
+            "insecure": insecure,
+        },
+    }
+
+    udp_relay = query_value(query, "udp_relay_mode") or query_value(query, "udp-relay-mode")
+    if udp_relay:
+        outbound["udp_relay_mode"] = udp_relay
+
+    if bool_value(query_value(query, "zero_rtt_handshake") or query_value(query, "reduce_rtt")):
+        outbound["zero_rtt_handshake"] = True
+
+    alpn = query_value(query, "alpn")
+    if alpn:
+        outbound["tls"]["alpn"] = [item.strip() for item in alpn.split(",") if item.strip()]
+
+    return outbound
+
+def parse_socks_or_http(link):
+    parts = urlsplit(link)
+    scheme = parts.scheme.lower()
+    port = parts.port
+    if not port:
+        if scheme == "https":
+            port = 443
+        elif scheme == "http":
+            port = 80
+
+    if not parts.hostname or not port:
+        raise ValueError("代理链接缺少服务器或端口")
+
+    is_socks = scheme in ("socks", "socks5", "socks5h", "socks4")
+    outbound = {
+        "type": "socks" if is_socks else "http",
+        "tag": tag_from_url(parts, scheme),
+        "server": parts.hostname,
+        "server_port": int(port),
+    }
+
+    if parts.username:
+        outbound["username"] = unquote(parts.username)
+    if parts.password:
+        outbound["password"] = unquote(parts.password)
+
+    if is_socks:
+        outbound["version"] = "4" if scheme == "socks4" else "5"
+
+    if scheme == "https":
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": parts.hostname,
+            "insecure": False,
+        }
+
+    return outbound
+
+
+def parse_sn(link):
+    parts = urlsplit(link)
+    blob = parts.query or parts.netloc
+
+    pad = "=" * (-len(blob) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(blob + pad)
+        data = zlib.decompress(raw)
+    except Exception as exc:
+        raise ValueError(f"sn:// 链接解码失败: {exc}") from exc
+
+    start = data.find(b"{")
+    if start == -1:
+        raise ValueError("sn:// 链接中未找到内嵌配置")
+
+    depth = 0
+    end = -1
+    for i in range(start, len(data)):
+        if data[i : i + 1] == b"{":
+            depth += 1
+        elif data[i : i + 1] == b"}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    if end == -1:
+        raise ValueError("sn:// 链接中内嵌配置不完整")
+
+    try:
+        text = data[start : end + 1].decode("utf-8", errors="surrogatepass")
+        text = text.encode("utf-16", "surrogatepass").decode("utf-16")
+        outbound = json.loads(text)
+    except Exception as exc:
+        raise ValueError(f"sn:// 链接内嵌配置解析失败: {exc}") from exc
+
+    if not isinstance(outbound, dict) or "type" not in outbound:
+        raise ValueError("sn:// 链接内嵌配置不是有效的 outbound")
+
+    return ensure_tag(outbound, "proxy")
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def parse_link(link):
+    link = normalize_link(link)
+    scheme = scheme_of(link)
+
+    if scheme == "vless":
+        return ensure_tag(parse_vless(link))
+    if scheme == "vmess":
+        return ensure_tag(parse_vmess(link))
+    if scheme == "trojan":
+        return ensure_tag(parse_trojan(link))
+    if scheme == "anytls":
+        return ensure_tag(parse_anytls(link))
+    if scheme == "ss":
+        return ensure_tag(parse_ss(link))
+    if scheme in ("hysteria2", "hy2"):
+        return ensure_tag(parse_hysteria2(link))
+    if scheme == "tuic":
+        return ensure_tag(parse_tuic(link))
+    if scheme in ("socks", "socks5", "socks5h", "socks4", "http", "https"):
+        return ensure_tag(parse_socks_or_http(link))
+    if scheme == "sn":
+        return ensure_tag(parse_sn(link))
+
+    raise ValueError("不支持的链接类型: " + (scheme or "(空)"))
+
+
 def _parse_proxy_outbound(url):
 
     url = (url or "").strip()
@@ -242,218 +1109,14 @@ def _parse_proxy_outbound(url):
     if "://" not in url:
 
         try:
-            padded = url.replace("-", "+").replace("_", "/")
-            padded += "=" * ((4 - len(padded) % 4) % 4)
-            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
+            decoded = b64decode(url)
             url = next((l.strip() for l in decoded.splitlines() if "://" in l), "")
         except Exception:
             return None
     if "://" not in url:
         return None
-
-    scheme = url.split("://")[0].lower()
     try:
-        if scheme == "vmess":
-            payload = url.split("://", 1)[1]
-            payload += "=" * ((4 - len(payload) % 4) % 4)
-            cfg = json.loads(base64.b64decode(payload).decode("utf-8", "ignore"))
-            out = {
-                "type": "vmess",
-                "server": cfg.get("add", ""),
-                "server_port": int(cfg.get("port") or 443),
-                "uuid": cfg.get("id", ""),
-                "security": cfg.get("scy") or "auto",
-                "alter_id": int(cfg.get("aid") or 0),
-            }
-            tls_flag = cfg.get("tls") or ""
-            if tls_flag in ("tls", "anytls") or cfg.get("sni"):
-                tls = {"enabled": True}
-                if cfg.get("sni") or cfg.get("host"):
-                    tls["server_name"] = cfg.get("sni") or cfg.get("host")
-                if cfg.get("alpn"):
-                    tls["alpn"] = [a for a in str(cfg["alpn"]).split(",") if a]
-                if tls_flag == "anytls":
-                    tls["insecure"] = True
-                out["tls"] = tls
-            if cfg.get("net") == "ws":
-                transport = {"type": "ws"}
-                if cfg.get("path"):
-                    transport["path"] = cfg["path"]
-                if cfg.get("host"):
-                    transport["headers"] = {"Host": cfg["host"]}
-                out["transport"] = transport
-            return out
-
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-        get = lambda k, d="": (params.get(k, [d]) or [d])[0]
-
-        if scheme in ("socks5", "socks", "socks5h"):
-            out = {
-                "type": "socks",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or 1080),
-                "version": "5",
-            }
-            if parsed.username:
-                out["username"] = unquote(parsed.username)
-            if parsed.password:
-                out["password"] = unquote(parsed.password)
-            return out
-
-        if scheme in ("http", "https"):
-            out = {
-                "type": "http",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or (443 if scheme == "https" else 8080)),
-            }
-            if parsed.username:
-                out["username"] = unquote(parsed.username)
-            if parsed.password:
-                out["password"] = unquote(parsed.password)
-            if scheme == "https":
-                out["tls"] = {"enabled": True}
-            return out
-
-        if scheme == "vless":
-            out = {
-                "type": "vless",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or 443),
-                "uuid": unquote(parsed.username or ""),
-            }
-            flow = get("flow")
-            if flow:
-                out["flow"] = flow
-            security = get("security")
-            if security in ("tls", "reality", "anytls"):
-                tls = {"enabled": True}
-                if get("sni"):
-                    tls["server_name"] = get("sni")
-                if get("alpn"):
-                    tls["alpn"] = [a for a in get("alpn").split(",") if a]
-                if get("fp"):
-                    tls["utls"] = {"enabled": True, "fingerprint": get("fp")}
-                if (
-                    get("insecure") in ("1", "true")
-                    or get("allowInsecure") in ("1", "true")
-                    or security == "anytls"
-                ):
-                    tls["insecure"] = True
-                if security == "reality":
-                    reality = {"enabled": True}
-                    if get("pbk"):
-                        reality["public_key"] = get("pbk")
-                    if get("sid"):
-                        reality["short_id"] = get("sid")
-                    tls["reality"] = reality
-                out["tls"] = tls
-            if get("type") == "ws":
-                transport = {"type": "ws"}
-                if get("path"):
-                    transport["path"] = unquote(get("path"))
-                if get("host"):
-                    transport["headers"] = {"Host": get("host")}
-                out["transport"] = transport
-            return out
-
-        if scheme == "trojan":
-            out = {
-                "type": "trojan",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or 443),
-                "password": unquote(parsed.username or ""),
-            }
-            if get("security", "tls") in ("tls", "anytls"):
-                tls = {"enabled": True}
-                if get("sni"):
-                    tls["server_name"] = get("sni")
-                if get("alpn"):
-                    tls["alpn"] = [a for a in get("alpn").split(",") if a]
-                if (
-                    get("insecure") in ("1", "true")
-                    or get("allowInsecure") in ("1", "true")
-                    or get("security") == "anytls"
-                ):
-                    tls["insecure"] = True
-                out["tls"] = tls
-            if get("type") == "ws":
-                transport = {"type": "ws"}
-                if get("path"):
-                    transport["path"] = unquote(get("path"))
-                if get("host"):
-                    transport["headers"] = {"Host": get("host")}
-                out["transport"] = transport
-            return out
-
-        if scheme in ("hy2", "hysteria2"):
-            out = {
-                "type": "hysteria2",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or 443),
-                "password": unquote(parsed.username or ""),
-            }
-            tls = {"enabled": True}
-            if get("sni"):
-                tls["server_name"] = get("sni")
-            if get("alpn"):
-                tls["alpn"] = [a for a in get("alpn").split(",") if a]
-            if get("insecure") in ("1", "true") or get("allowInsecure") in (
-                "1",
-                "true",
-            ):
-                tls["insecure"] = True
-            out["tls"] = tls
-            return out
-
-        if scheme == "tuic":
-            user_part = unquote(parsed.username or "")
-            pass_part = unquote(parsed.password or "")
-            if ":" in user_part and not pass_part:
-                uuid, password = user_part.split(":", 1)
-            else:
-                uuid, password = user_part, pass_part
-            out = {
-                "type": "tuic",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or 443),
-                "uuid": uuid,
-                "password": password,
-                "congestion_control": get("congestion_control", "bbr"),
-            }
-            tls = {"enabled": True}
-            if get("sni"):
-                tls["server_name"] = get("sni")
-            if get("alpn"):
-                tls["alpn"] = [a for a in get("alpn").split(",") if a]
-            if get("insecure") in ("1", "true") or get("allowInsecure") in (
-                "1",
-                "true",
-            ):
-                tls["insecure"] = True
-            out["tls"] = tls
-            return out
-
-        if scheme in ("ss", "shadowsocks"):
-            user_part = unquote(parsed.username or "")
-            pass_part = unquote(parsed.password or "")
-            auth = f"{user_part}:{pass_part}" if pass_part else user_part
-            method, password = user_part, pass_part
-            try:
-                padded = auth.replace("-", "+").replace("_", "/")
-                padded += "=" * ((4 - len(padded) % 4) % 4)
-                decoded = base64.b64decode(padded).decode("utf-8", "ignore")
-                if ":" in decoded:
-                    method, password = decoded.split(":", 1)
-            except Exception:
-                pass
-            return {
-                "type": "shadowsocks",
-                "server": parsed.hostname,
-                "server_port": int(parsed.port or 8388),
-                "method": method,
-                "password": password,
-            }
+        return parse_link(url)
     except Exception as e:
         log(f"⚠️ 解析代理链接失败: {e}")
     return None
@@ -669,7 +1332,6 @@ def send_telegram_notification(summary):
                 [
                     f"👤 <b>账号:</b> {html_mod.escape(str(item.get('full_user') or item['user']), quote=False)}",
                     f"🌐 <b>出口IP:</b> <code>{html_mod.escape(str(item['ip']), quote=False)}</code>",
-                    f"🔑 <b>登录:</b> {html_mod.escape(str(item['login_method']), quote=False)}",
                     f"⚡ <b>续期:</b> {ok} 成功 / {skip} 未到期 / {fail} 失败",
                     f"📅 <b>到期:</b> {html_mod.escape(str(due), quote=False)}",
                 ]
@@ -829,7 +1491,7 @@ def send_wxpush_notification(summary):
         return False
 
 
-def build_full_summary(accounts, state, results):
+def build_full_summary(accounts, state, results, ips=None):
     by_id = {r["id"]: r for r in results}
     full = []
     for acc in accounts:
@@ -851,7 +1513,7 @@ def build_full_summary(accounts, state, results):
                 "status": "❌ 上次续期失败，退避中" if backoff else "⏭️ 未到期，已跳过",
                 "old_due": due,
                 "new_due": due,
-                "ip": "未检测",
+                "ip": (ips or {}).get(acc["id"], "未检测"),
                 "failed": backoff,
             }
         )
@@ -1606,14 +2268,27 @@ def main():
     log(f"✅ 环境隔离校验通过：{len(accounts)} 个账号各自使用独立代理")
 
     pending_ids = accounts_to_renew(accounts, state)
-    if not pending_ids:
-        log("⏭️ 所有账号均未到期，本次不启动浏览器，仅发送汇总通知。")
-        send_notifications(build_full_summary(accounts, state, []))
-        sys.exit(0)
     pending = [a for a in accounts if a["id"] in pending_ids]
-    log(f"🎯 本次需要续期的账号: {', '.join(a['id'] for a in pending)}")
+    if pending:
+        log(f"🎯 本次需要续期的账号: {', '.join(a['id'] for a in pending)}")
 
-    start_singbox(pending)
+    start_singbox(accounts)
+
+    ips = {}
+    for acc in accounts:
+        if acc["id"] in pending_ids:
+            continue
+        if acc.get("proxy_ready"):
+            ips[acc["id"]] = get_current_ip(f"http://127.0.0.1:{acc['port']}")
+            log(f"🔎 账号 {acc['id']} 节点检测，出口IP: {mask_ip(ips[acc['id']])}")
+        else:
+            ips[acc["id"]] = "获取失败"
+
+    if not pending:
+        log("⏭️ 所有账号均未到期，本次不启动浏览器，仅检测节点并发送汇总通知。")
+        stop_singbox()
+        send_notifications(build_full_summary(accounts, state, [], ips))
+        sys.exit(0)
 
     summary = []
     exit_code = 0
@@ -1647,7 +2322,7 @@ def main():
 
     save_state(state)
 
-    send_notifications(build_full_summary(accounts, state, summary))
+    send_notifications(build_full_summary(accounts, state, summary, ips))
 
     log("═══════════ 运行汇总 ═══════════")
     for item in summary:
