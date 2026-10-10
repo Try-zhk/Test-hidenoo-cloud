@@ -85,7 +85,6 @@ jobs:
           PY
 
       - name: ⚙ 设置 Python
-        if: env.SHOULD_RUN == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -120,7 +119,6 @@ jobs:
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🔑 注入环境变量
-        if: env.SHOULD_RUN == 'true'
         env:
           SECRETS_JSON: ${{ toJson(secrets) }}
           VARS_JSON: ${{ toJson(vars) }}
@@ -181,6 +179,12 @@ jobs:
         if: env.SHOULD_RUN == 'true'
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+
+      - name: 📨 无需续期，仅发送汇总通知
+        if: env.SHOULD_RUN != 'true'
+        run: |
+          pip install requests 'requests[socks]'
+          python -u app.py
 
       - name: 📸 上传调试截图
         if: always() && env.SHOULD_RUN == 'true'
