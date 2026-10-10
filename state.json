@@ -38,5 +38,14 @@
     "updated_at": "2026-10-10 06:21:17",
     "last_result": "success",
     "login_method": "密码验证 + CF盾"
+  },
+  "ACCOUNT_6": {
+    "service_id": "229287",
+    "due_date": "未知",
+    "due_ts": 0,
+    "updated_at": "2026-10-10 08:33:46",
+    "last_result": "failed",
+    "retry_at": 1791642891.0,
+    "login_method": "密码验证 + CF盾"
   }
 }
