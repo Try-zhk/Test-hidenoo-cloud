@@ -1,0 +1,55 @@
+{
+  "ACCOUNT_2": {
+    "service_id": "215067",
+    "due_date": "16 Oct 2026",
+    "due_ts": 1792108800,
+    "updated_at": "2026-10-10 05:07:47",
+    "last_result": "success"
+  },
+  "ACCOUNT_3": {
+    "service_id": "233347",
+    "due_date": "14 Oct 2026",
+    "due_ts": 1791936000,
+    "updated_at": "2026-10-13 07:31:55",
+    "last_result": "failed",
+    "retry_at": 1791898450.0,
+    "login_method": "密码验证 + CF盾"
+  },
+  "ACCOUNT_4": {
+    "service_id": "224608",
+    "due_date": "17 Oct 2026",
+    "due_ts": 1792195200,
+    "updated_at": "2026-10-10 05:10:03"
+  },
+  "ACCOUNT_1": {
+    "service_id": "233394",
+    "due_date": "15 Oct 2026",
+    "due_ts": 1792022400,
+    "updated_at": "2026-10-10 05:44:53"
+  },
+  "ACCOUNT_5": {
+    "service_id": "225980",
+    "due_date": "18 Oct 2026",
+    "due_ts": 1792281600,
+    "updated_at": "2026-10-10 06:12:51",
+    "login_method": "密码验证 + CF盾"
+  },
+  "ACCOUNT_7": {
+    "service_id": "233352",
+    "due_date": "14 Oct 2026",
+    "due_ts": 1791936000,
+    "updated_at": "2026-10-13 07:35:02",
+    "last_result": "failed",
+    "login_method": "密码验证 + CF盾",
+    "retry_at": 1791898584.0
+  },
+  "ACCOUNT_6": {
+    "service_id": "229287",
+    "due_date": "17 Oct 2026",
+    "due_ts": 1792195200,
+    "updated_at": "2026-10-10 17:38:17",
+    "last_result": "failed",
+    "retry_at": 1791642891.0,
+    "login_method": "密码验证 + CF盾"
+  }
+}
