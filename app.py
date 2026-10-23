@@ -1382,7 +1382,7 @@ def send_telegram_notification(summary):
         blocks.append(
             "\n".join(
                 [
-                    f"👤 <b>账号:</b> {html_mod.escape(str(item['user']), quote=False)}",
+                    f"👤 <b>账号:</b> {html_mod.escape(str(item.get('full_user') or item['user']), quote=False)}",
                     f"🌐 <b>出口IP:</b> <code>{html_mod.escape(str(item['ip']), quote=False)}</code>",
                     f"⚡ <b>续期:</b> {ok} 成功 / {skip} 未到期 / {fail} 失败",
                     f"📅 <b>到期:</b> {html_mod.escape(str(due), quote=False)}",
@@ -2459,7 +2459,7 @@ def _fatal_notify(reason):
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             {
                 "chat_id": TG_CHAT,
-                "text": f"☁️ <b>HidenCloud 续期脚本异常</b>\n{escape_html(reason)}",
+                "text": f"☁️ <b>HidenCloud 续期脚本异常</b>\n{html_mod.escape(str(reason), quote=False)}",
                 "parse_mode": "HTML",
             },
         )
