@@ -3,7 +3,13 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 23 * * 0' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+    - cron: '0 1 * * *'
+    - cron: '0 13 * * *'
+
+# 并发锁：同一时间只允许一条续期运行，防止定时任务撞车互相覆盖 state.json
+concurrency:
+  group: renew-hidencloud
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -12,7 +18,7 @@ permissions:
 jobs:
   renew-hiden:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -21,6 +27,66 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
+      - name: 🔎 检查是否有账号需要续期
+        id: precheck
+        env:
+          SECRETS_JSON: ${{ toJson(secrets) }}
+          VARS_JSON: ${{ toJson(vars) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+
+          variables = json.loads(os.environ.get('VARS_JSON') or '{}')
+          try:
+              due_within_hours = float(variables.get('DUE_WITHIN_HOURS') or 24)
+          except (TypeError, ValueError):
+              print('⚠️ DUE_WITHIN_HOURS 不是数字，按默认 24 处理')
+              due_within_hours = 24.0
+
+          accounts = {}
+          for key, value in (json.loads(os.environ.get('SECRETS_JSON') or '{}')).items():
+              if key.startswith('HIDEN_ACCOUNT_') and (value or '').strip():
+                  parts = (value or '').split()
+                  if len(parts) >= 2:
+                      accounts[key.replace('HIDEN_ACCOUNT_', '')] = True
+
+          state = {}
+          if os.path.exists('state.json'):
+              try:
+                  state = json.load(open('state.json', encoding='utf-8'))
+              except Exception:
+                  state = {}
+
+          now = int(time.time())
+          pending = []
+          for acc_id in sorted(accounts, key=int):
+              acc_state = state.get(f'ACCOUNT_{acc_id}') or {}
+              due_ts = acc_state.get('due_ts') or 0
+
+              if not due_ts:
+                  print(f'🆕 账号 {acc_id}: state.json 无到期记录，需要运行')
+                  pending.append(acc_id)
+                  continue
+              remaining = due_ts - now
+              if remaining <= due_within_hours * 3600:
+                  print(f'⏰ 账号 {acc_id}: 剩余 {remaining/3600:.1f} 小时（到期日 {acc_state.get("due_date")}），需要运行')
+                  pending.append(acc_id)
+              else:
+                  print(f'✅ 账号 {acc_id}: 剩余 {remaining/3600:.1f} 小时（到期日 {acc_state.get("due_date")}），跳过')
+
+          should_run = 'true' if pending else 'false'
+          if not pending:
+              print('⏭️ 所有账号均未到期，跳过后续所有步骤。')
+          else:
+              print(f'🎯 本次需要续期的账号: {", ".join(pending)}')
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
+              fh.write(f'SHOULD_RUN={should_run}\n')
+              fh.write(f'RENEW_ACCOUNTS={",".join(pending)}\n')
+              fh.write(f'DUE_WITHIN_HOURS={due_within_hours:g}\n')
+          PY
 
       - name: ⚙ 设置 Python
         uses: actions/setup-python@v6
@@ -28,29 +94,126 @@ jobs:
           python-version: '3.13'
 
       - name: 🛠️ 安装系统依赖和python依赖
+        if: env.SHOULD_RUN == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
           pip install patchright requests 'requests[socks]'
           python -m patchright install --with-deps chrome
 
-      - name: ⚙ 设置sing-box代理
+      - name: 📦 安装 sing-box（供各账号独立代理使用）
+        # 无条件安装：无需续期的运行也要用它做各账号的节点检测
+        continue-on-error: true
+        run: |
+          VER=1.13.16
+          wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz" \
+            && tar -xzf sing-box.tar.gz \
+            && mv "sing-box-${VER}-linux-amd64/sing-box" ./ \
+            && chmod +x ./sing-box \
+            && echo "SINGBOX_BIN=$PWD/sing-box" >> $GITHUB_ENV \
+            && echo "✅ sing-box 就绪" \
+            || echo "⚠️ sing-box 下载失败，本次将无法运行"
+
+      - name: ⚙ 设置全局代理（可选 NODE_LINK）
+        if: env.SHOULD_RUN == 'true'
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期脚本
+      - name: 🔑 注入环境变量
         env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+          SECRETS_JSON: ${{ toJson(secrets) }}
+          VARS_JSON: ${{ toJson(vars) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+          secrets = json.loads(os.environ.get('SECRETS_JSON') or '{}')
+          variables = json.loads(os.environ.get('VARS_JSON') or '{}')
+
+          account_pattern = re.compile(r'^(HIDEN_ACCOUNT|PROXY_URL|PROXY_LOCK)_\d+$')
+          fixed_names = {
+              'EMAIL', 'PASSWORD', 'PROXY_URL', 'PROXY_LOCK', 'NODE_LINK',
+              'TG_TOKEN', 'TG_CHAT', 'SMTP_CONFIG', 'EMAIL_CHAT',
+              'WXPUSH_API', 'WXPUSH_TOKEN',
+              'TG_BOT_TOKEN', 'TG_CHAT_ID',
+              'DUE_WITHIN_HOURS', 'MAX_RUN_SECONDS', 'RENEW_MAX_ATTEMPTS',
+              'BROWSER_TZ', 'BROWSER_LOCALE',
+          }
+
+          names = sorted(n for n in (set(secrets) | set(variables))
+                         if n in fixed_names or account_pattern.match(n))
+
+          out = []
+          for name in names:
+              value = secrets.get(name)
+              if value in (None, ''):
+                  value = variables.get(name)
+              if value in (None, ''):
+                  continue
+              out.append(f'{name}<<__EOF__\n{value}\n__EOF__')
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
+              fh.write('\n'.join(out) + '\n')
+
+          print('已注入变量: ' + ', '.join(names))
+          if not any(n.startswith('HIDEN_ACCOUNT_') for n in names):
+              print('::error::未找到任何 HIDEN_ACCOUNT_n，请检查仓库 Secrets 是否配置了 HIDEN_ACCOUNT_1')
+          PY
+
+      - name: ✅ 校验变量已生效
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            name="HIDEN_ACCOUNT_$i"
+            value="$(printenv "$name" || true)"
+            if [ -n "$value" ]; then
+              echo "✅ $name 已生效（长度 ${#value}）"
+            fi
+          done
+          if [ -z "$(printenv HIDEN_ACCOUNT_1 || true)" ]; then
+            echo "::error::HIDEN_ACCOUNT_1 未注入成功。请确认在 Settings → Secrets and variables → Actions 的 Secrets 中已添加 HIDEN_ACCOUNT_1（格式：邮箱 密码）"
+            exit 1
+          fi
+
+      - name: 🚀 运行续期脚本
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+
+      - name: 📨 无需续期，仅发送汇总通知
+        if: env.SHOULD_RUN != 'true'
+        run: |
+          pip install requests 'requests[socks]'
+          python -u app.py
+
+      - name: 📸 上传调试截图
+        if: always() && env.SHOULD_RUN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: art/**/*.png
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 💾 提交 state.json
+        if: always() && env.SHOULD_RUN == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state change"
+          else
+            git commit -m "💾 Update state.json $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git pull --rebase origin main || true
+            git push || true
+          fi
+
       - name: 🕒 更新时间
         run: |
           git config user.name "github-actions[bot]"
@@ -61,9 +224,10 @@ jobs:
             echo "No need to commit"
           else
             git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git pull --rebase origin main || true
             git push origin main
           fi
-      
+
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
