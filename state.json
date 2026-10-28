@@ -49,9 +49,9 @@
   },
   "ACCOUNT_1": {
     "service_id": "233394",
-    "due_date": "29 Oct 2026",
-    "due_ts": 1793232000,
-    "updated_at": "2026-10-21 06:50:35",
+    "due_date": "05 Nov 2026",
+    "due_ts": 1793836800,
+    "updated_at": "2026-10-28 14:44:46",
     "last_result": "success",
     "login_method": "密码验证 + CF盾"
   }
