@@ -3,7 +3,7 @@
     "service_id": "215067",
     "due_date": "13 Nov 2026",
     "due_ts": 1794528000,
-    "updated_at": "2026-11-12 12:28:34",
+    "updated_at": "2026-11-12 16:07:10",
     "login_method": "密码验证 + CF盾",
     "last_result": "failed"
   },
@@ -43,7 +43,7 @@
     "service_id": "233394",
     "due_date": "12 Nov 2026",
     "due_ts": 1794441600,
-    "updated_at": "2026-11-12 12:22:22",
+    "updated_at": "2026-11-12 16:01:06",
     "last_result": "failed",
     "login_method": "密码验证 + CF盾"
   },
