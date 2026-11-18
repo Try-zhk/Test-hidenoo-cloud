@@ -27,7 +27,7 @@
     "service_id": "225980",
     "due_date": "15 Nov 2026",
     "due_ts": 1794700800,
-    "updated_at": "2026-11-18 16:30:25",
+    "updated_at": "2026-11-19 05:34:15",
     "login_method": "密码验证 + CF盾",
     "last_result": "failed"
   },
@@ -35,7 +35,7 @@
     "service_id": "233352",
     "due_date": "18 Nov 2026",
     "due_ts": 1794960000,
-    "updated_at": "2026-11-18 16:37:04",
+    "updated_at": "2026-11-19 05:40:49",
     "last_result": "failed",
     "login_method": "密码验证 + CF盾"
   },
@@ -43,7 +43,7 @@
     "service_id": "233394",
     "due_date": "19 Nov 2026",
     "due_ts": 1795046400,
-    "updated_at": "2026-11-18 16:18:14",
+    "updated_at": "2026-11-19 05:26:19",
     "last_result": "failed",
     "login_method": "密码验证 + CF盾"
   },
